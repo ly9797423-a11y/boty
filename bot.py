@@ -2,1479 +2,2594 @@
 # -*- coding: utf-8 -*-
 
 """
-بوت تليجرام متكامل للتحكم بالقنوات - نظام يدوي
-المطور: @Allawi04
-الإصدار: 3.0
+بوت تمويل متكامل لتليجرام
+الإصدار: 1.0
+المطور: System
 """
 
-import logging
-import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
 import os
+import sys
 import json
+import asyncio
+import logging
+import sqlite3
+import random
+import string
+import time
+import shutil
+import hashlib
 import re
-from enum import Enum
-import pytz
-from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Any, Union
+from pathlib import Path
+from contextlib import contextmanager
 from collections import defaultdict
-import html
-import traceback
-from uuid import uuid4
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember, Chat
+from functools import wraps
+import aiofiles
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
-    filters,
-    ContextTypes,
+    CallbackQueryHandler,
     ConversationHandler,
-    ChatMemberHandler
+    ContextTypes,
+    filters
 )
-from telegram.constants import ParseMode, ChatType
-from telegram.error import TelegramError
+from telegram.constants import ParseMode, ChatMemberStatus
+from telegram.error import TelegramError, BadRequest, Forbidden
+import pytz
+from colorama import init, Fore, Back, Style
 
-from supabase import create_client, Client
+# تهيئة colorama
+init(autoreset=True)
 
-# ==================== التهيئة والإعدادات ====================
+# ==================== الإعدادات الأساسية ====================
 
-# إعداد التسجيل
+BOT_TOKEN = "8699966374:AAGCCGehxTQzGbEkBxIe7L3vecLPcvzGrHg"
+ADMIN_IDS = [6615860762, 6130994941]  # معرفي المديرين
+
+# مجلدات البوت
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+NUMBERS_DIR = DATA_DIR / "numbers"
+BACKUP_DIR = DATA_DIR / "backup"
+LOGS_DIR = BASE_DIR / "logs"
+
+# إنشاء المجلدات المطلوبة
+for dir_path in [DATA_DIR, NUMBERS_DIR, BACKUP_DIR, LOGS_DIR]:
+    dir_path.mkdir(parents=True, exist_ok=True)
+
+# إعداد التسجيل (logging)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
     handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.FileHandler(LOGS_DIR / f"bot_{datetime.now().strftime('%Y%m%d')}.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# إعدادات البوت
-BOT_TOKEN = "8625525956:AAGYmiC0L886KLIntvKCS0xLArMRo_62zOc"
-ADMIN_ID = 6130994941
-ADMIN_USERNAME = "Allawi04"
+# ==================== إدارة قاعدة البيانات ====================
 
-# إعدادات Supabase
-SUPABASE_URL = "https://wregsrzadpgrccuaeoqg.supabase.co"
-SUPABASE_KEY = "sb_publishable_wxK2zSkofxB1-V4FrQyvlg_jrBpMCM0"
-
-# إعدادات الأسعار
-VIP_PRICE = 25  # سعر VIP بالنجوم (للعرض فقط)
-MAX_FREE_CHANNELS = 2
-MAX_VIP_CHANNELS = 10
-FREE_TRIAL_DAYS = 14
-VIP_DAYS = 30
-
-# المناطق الزمنية
-TIMEZONE = pytz.timezone('Asia/Baghdad')
-
-# ==================== حالات المحادثة ====================
-
-# حالات إضافة القناة
-ADD_CHANNEL_WAITING_LINK = 1
-ADD_CHANNEL_VERIFYING = 2
-
-# حالات تفعيل VIP (للمدير)
-ACTIVATE_VIP_WAITING_USER_ID = 3
-ACTIVATE_VIP_WAITING_DAYS = 4
-
-# حالات الإذاعة
-BROADCAST_WAITING_MESSAGE = 5
-BROADCAST_CONFIRM = 6
-
-# حالات تغيير السعر
-CHANGE_PRICE_WAITING = 7
-
-# ==================== نماذج البيانات ====================
-
-@dataclass
-class ChannelData:
-    """بيانات القناة"""
-    id: int
-    link: str
-    title: str
-    added_date: datetime
-    is_active: bool = True
+class DatabaseManager:
+    """إدارة قاعدة البيانات بشكل آمن"""
     
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'link': self.link,
-            'title': self.title,
-            'added_date': self.added_date.isoformat() if isinstance(self.added_date, datetime) else self.added_date,
-            'is_active': self.is_active
-        }
+    def __init__(self, db_path: str = "bot_database.db"):
+        self.db_path = DATA_DIR / db_path
+        self.init_database()
     
-    @classmethod
-    def from_dict(cls, data):
-        if isinstance(data.get('added_date'), str):
-            data['added_date'] = datetime.fromisoformat(data['added_date'])
-        return cls(**data)
+    def init_database(self):
+        """إنشاء جداول قاعدة البيانات"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # جدول المستخدمين
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    points INTEGER DEFAULT 0,
+                    referrals INTEGER DEFAULT 0,
+                    joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_banned BOOLEAN DEFAULT 0,
+                    is_admin BOOLEAN DEFAULT 0,
+                    referrer_id INTEGER DEFAULT NULL,
+                    total_funded INTEGER DEFAULT 0,
+                    settings TEXT DEFAULT '{}'
+                )
+            ''')
+            
+            # جدول روابط الدعوة
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS referral_links (
+                    user_id INTEGER PRIMARY KEY,
+                    link_code TEXT UNIQUE,
+                    clicks INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # جدول التمويلات
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS funding_requests (
+                    request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    chat_id TEXT,
+                    chat_title TEXT,
+                    members_count INTEGER,
+                    cost_points INTEGER,
+                    status TEXT DEFAULT 'pending',
+                    added_count INTEGER DEFAULT 0,
+                    remaining_count INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    chat_type TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # جدول أرقام التمويل
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS funding_numbers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone_number TEXT UNIQUE,
+                    is_used BOOLEAN DEFAULT 0,
+                    added_by INTEGER,
+                    file_name TEXT,
+                    added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    used_date TIMESTAMP,
+                    used_in_request INTEGER,
+                    FOREIGN KEY (added_by) REFERENCES users (user_id),
+                    FOREIGN KEY (used_in_request) REFERENCES funding_requests (request_id)
+                )
+            ''')
+            
+            # جدول إعدادات البوت
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # جدول القنوات الإجبارية
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS force_channels (
+                    channel_id TEXT PRIMARY KEY,
+                    channel_username TEXT,
+                    channel_title TEXT,
+                    added_by INTEGER,
+                    added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active BOOLEAN DEFAULT 1
+                )
+            ''')
+            
+            # جدول المستخدمين المحظورين
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    user_id INTEGER PRIMARY KEY,
+                    banned_by INTEGER,
+                    reason TEXT,
+                    banned_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id),
+                    FOREIGN KEY (banned_by) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # جدول سجل النقاط
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS points_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    amount INTEGER,
+                    action_type TEXT,
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # جدول ملفات الأرقام
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS number_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_name TEXT,
+                    file_path TEXT,
+                    numbers_count INTEGER,
+                    added_by INTEGER,
+                    added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active BOOLEAN DEFAULT 1,
+                    FOREIGN KEY (added_by) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # إدراج الإعدادات الافتراضية
+            default_settings = [
+                ('referral_reward', '10'),
+                ('member_cost', '8'),
+                ('welcome_message', '👋 مرحباً بك في بوت التمويل!\nنقاطك: {points}\nايديك: {user_id}\n@{username}'),
+                ('support_username', 'support_bot'),
+                ('channel_username', 'channel_username'),
+                ('min_withdraw', '100'),
+                ('max_daily_funding', '1000'),
+                ('bot_status', 'active'),
+                ('backup_time', '03:00'),
+                ('auto_clean_days', '30')
+            ]
+            
+            for key, value in default_settings:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)
+                ''', (key, value))
+            
+            conn.commit()
+    
+    @contextmanager
+    def get_connection(self):
+        """الحصول على اتصال بقاعدة البيانات"""
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+        finally:
+            conn.close()
+    
+    def execute_query(self, query: str, params: tuple = (), fetch_one: bool = False):
+        """تنفيذ استعلام قاعدة بيانات"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+            if fetch_one:
+                return cursor.fetchone()
+            return cursor.fetchall()
+    
+    def execute_insert(self, query: str, params: tuple = ()) -> int:
+        """تنفيذ إدراج والحصول على آخر ID"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+            return cursor.lastrowid
 
-@dataclass
-class UserSettings:
-    """إعدادات المستخدم"""
-    ban_new_members: bool = False
-    ban_leavers: bool = False
-    ban_no_username: bool = False
+# إنشاء كائن قاعدة البيانات
+db = DatabaseManager()
+
+# ==================== الإحصائيات والمراقبة ====================
+
+class BotStats:
+    """إحصائيات البوت"""
     
-    def to_dict(self):
-        return {
-            'ban_new_members': self.ban_new_members,
-            'ban_leavers': self.ban_leavers,
-            'ban_no_username': self.ban_no_username
-        }
+    @staticmethod
+    def get_total_users() -> int:
+        """عدد المستخدمين الكلي"""
+        result = db.execute_query("SELECT COUNT(*) as count FROM users", fetch_one=True)
+        return result['count'] if result else 0
     
-    @classmethod
-    def from_dict(cls, data):
-        return cls(
-            ban_new_members=data.get('ban_new_members', False),
-            ban_leavers=data.get('ban_leavers', False),
-            ban_no_username=data.get('ban_no_username', False)
+    @staticmethod
+    def get_active_users(days: int = 7) -> int:
+        """عدد المستخدمين النشطين خلال آخر X أيام"""
+        cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+        result = db.execute_query(
+            "SELECT COUNT(*) as count FROM users WHERE last_active > ?",
+            (cutoff,),
+            fetch_one=True
         )
-
-@dataclass
-class UserData:
-    """بيانات المستخدم الكاملة"""
-    user_id: int
-    username: Optional[str]
-    first_name: str
-    join_date: datetime
-    expiry_date: datetime
-    is_vip: bool = False
-    is_active: bool = True
-    is_banned: bool = False
-    channels: List[ChannelData] = None
-    settings: UserSettings = None
-    total_payments: int = 0
-    last_active: Optional[datetime] = None
+        return result['count'] if result else 0
     
-    def __post_init__(self):
-        if self.channels is None:
-            self.channels = []
-        if self.settings is None:
-            self.settings = UserSettings()
+    @staticmethod
+    def get_banned_users() -> int:
+        """عدد المستخدمين المحظورين"""
+        result = db.execute_query("SELECT COUNT(*) as count FROM banned_users", fetch_one=True)
+        return result['count'] if result else 0
     
-    def to_dict(self):
-        return {
-            'user_id': self.user_id,
-            'username': self.username,
-            'first_name': self.first_name,
-            'join_date': self.join_date.isoformat() if isinstance(self.join_date, datetime) else self.join_date,
-            'expiry_date': self.expiry_date.isoformat() if isinstance(self.expiry_date, datetime) else self.expiry_date,
-            'is_vip': self.is_vip,
-            'is_active': self.is_active,
-            'is_banned': self.is_banned,
-            'channels': [c.to_dict() for c in self.channels],
-            'settings': self.settings.to_dict(),
-            'total_payments': self.total_payments,
-            'last_active': self.last_active.isoformat() if isinstance(self.last_active, datetime) else self.last_active
-        }
+    @staticmethod
+    def get_total_points() -> int:
+        """مجموع النقاط في النظام"""
+        result = db.execute_query("SELECT SUM(points) as total FROM users", fetch_one=True)
+        return result['total'] if result and result['total'] else 0
     
-    @classmethod
-    def from_dict(cls, data):
-        # تحويل التواريخ
-        if isinstance(data.get('join_date'), str):
-            data['join_date'] = datetime.fromisoformat(data['join_date'])
-        if isinstance(data.get('expiry_date'), str):
-            data['expiry_date'] = datetime.fromisoformat(data['expiry_date'])
-        if isinstance(data.get('last_active'), str):
-            data['last_active'] = datetime.fromisoformat(data['last_active'])
-        
-        # تحويل القنوات
-        channels = []
-        for c in data.get('channels', []):
-            if isinstance(c, dict):
-                channels.append(ChannelData.from_dict(c))
-        
-        # تحويل الإعدادات
-        settings = UserSettings.from_dict(data.get('settings', {}))
-        
-        return cls(
-            user_id=data['user_id'],
-            username=data.get('username'),
-            first_name=data.get('first_name', ''),
-            join_date=data['join_date'],
-            expiry_date=data['expiry_date'],
-            is_vip=data.get('is_vip', False),
-            is_active=data.get('is_active', True),
-            is_banned=data.get('is_banned', False),
-            channels=channels,
-            settings=settings,
-            total_payments=data.get('total_payments', 0),
-            last_active=data.get('last_active')
+    @staticmethod
+    def get_total_funding() -> int:
+        """عدد التمويلات المنفذة"""
+        result = db.execute_query(
+            "SELECT COUNT(*) as count FROM funding_requests WHERE status = 'completed'",
+            fetch_one=True
         )
+        return result['count'] if result else 0
+    
+    @staticmethod
+    def get_total_members_added() -> int:
+        """عدد الأعضاء المضافين"""
+        result = db.execute_query(
+            "SELECT SUM(added_count) as total FROM funding_requests WHERE status = 'completed'",
+            fetch_one=True
+        )
+        return result['total'] if result and result['total'] else 0
+    
+    @staticmethod
+    def get_available_numbers() -> int:
+        """عدد الأرقام المتاحة للتمويل"""
+        result = db.execute_query(
+            "SELECT COUNT(*) as count FROM funding_numbers WHERE is_used = 0",
+            fetch_one=True
+        )
+        return result['count'] if result else 0
+    
+    @staticmethod
+    def get_total_numbers() -> int:
+        """إجمالي الأرقام المضافة"""
+        result = db.execute_query("SELECT COUNT(*) as count FROM funding_numbers", fetch_one=True)
+        return result['count'] if result else 0
+    
+    @staticmethod
+    def get_top_users(limit: int = 10) -> List[Dict]:
+        """أفضل المستخدمين من حيث النقاط"""
+        results = db.execute_query("""
+            SELECT user_id, username, points, referrals, total_funded 
+            FROM users 
+            WHERE is_banned = 0 
+            ORDER BY points DESC 
+            LIMIT ?
+        """, (limit,))
+        return [dict(row) for row in results]
 
-# ==================== قاعدة البيانات ====================
+stats = BotStats()
 
-class Database:
-    """إدارة قاعدة البيانات باستخدام Supabase"""
-    
-    def __init__(self, url: str, key: str):
-        self.client: Client = create_client(url, key)
-        self.cache = {}
-        self.cache_timeout = 300  # 5 دقائق
-    
-    async def init_tables(self):
-        """إنشاء الجداول إذا لم تكن موجودة"""
-        try:
-            response = self.client.table('users').select("*").limit(1).execute()
-            logger.info("✅ Database connected successfully")
-        except Exception as e:
-            logger.error(f"❌ Database initialization error: {e}")
-    
-    async def get_user(self, user_id: int) -> Optional[UserData]:
-        """الحصول على بيانات مستخدم"""
-        try:
-            cache_key = f"user_{user_id}"
-            if cache_key in self.cache:
-                cache_time, user_data = self.cache[cache_key]
-                if (datetime.now() - cache_time).seconds < self.cache_timeout:
-                    return user_data
-            
-            response = self.client.table('users').select("*").eq('user_id', user_id).execute()
-            
-            if response.data:
-                user_data = UserData.from_dict(response.data[0])
-                self.cache[cache_key] = (datetime.now(), user_data)
-                return user_data
-            return None
-        except Exception as e:
-            logger.error(f"Error getting user {user_id}: {e}")
-            return None
-    
-    async def create_user(self, user_id: int, username: str = None, first_name: str = None) -> UserData:
-        """إنشاء مستخدم جديد"""
-        try:
-            now = datetime.now(TIMEZONE)
-            expiry_date = now + timedelta(days=FREE_TRIAL_DAYS)
-            
-            new_user = UserData(
-                user_id=user_id,
-                username=username,
-                first_name=first_name or "",
-                join_date=now,
-                expiry_date=expiry_date,
-                is_vip=False,
-                is_active=True,
-                is_banned=False,
-                channels=[],
-                settings=UserSettings(),
-                total_payments=0,
-                last_active=now
-            )
-            
-            data = new_user.to_dict()
-            response = self.client.table('users').insert(data).execute()
-            
-            if response.data:
-                logger.info(f"✅ Created new user: {user_id}")
-                return new_user
-            else:
-                raise Exception("Failed to create user")
-        except Exception as e:
-            logger.error(f"Error creating user {user_id}: {e}")
-            raise
-    
-    async def update_user(self, user_id: int, **kwargs) -> bool:
-        """تحديث بيانات مستخدم"""
-        try:
-            response = self.client.table('users').update(kwargs).eq('user_id', user_id).execute()
-            
-            cache_key = f"user_{user_id}"
-            if cache_key in self.cache:
-                user = self.cache[cache_key][1]
-                for key, value in kwargs.items():
-                    if hasattr(user, key):
-                        setattr(user, key, value)
-                self.cache[cache_key] = (datetime.now(), user)
-            
-            return bool(response.data)
-        except Exception as e:
-            logger.error(f"Error updating user {user_id}: {e}")
-            return False
-    
-    async def get_or_create_user(self, user_id: int, username: str = None, first_name: str = None) -> UserData:
-        """الحصول على المستخدم أو إنشاؤه"""
-        user = await self.get_user(user_id)
-        if not user:
-            user = await self.create_user(user_id, username, first_name)
-        else:
-            await self.update_user(user_id, last_active=datetime.now(TIMEZONE).isoformat())
-        return user
-    
-    async def get_all_users(self) -> List[UserData]:
-        """الحصول على جميع المستخدمين"""
-        try:
-            response = self.client.table('users').select("*").execute()
-            return [UserData.from_dict(u) for u in response.data]
-        except Exception as e:
-            logger.error(f"Error getting all users: {e}")
-            return []
-    
-    async def add_channel(self, user_id: int, channel_data: ChannelData) -> Tuple[bool, str]:
-        """إضافة قناة لمستخدم"""
-        try:
-            user = await self.get_user(user_id)
-            if not user:
-                return False, "المستخدم غير موجود"
-            
-            max_channels = MAX_VIP_CHANNELS if user.is_vip else MAX_FREE_CHANNELS
-            if len(user.channels) >= max_channels:
-                return False, f"لا يمكنك إضافة أكثر من {max_channels} قنوات"
-            
-            for ch in user.channels:
-                if ch.id == channel_data.id:
-                    return False, "هذه القناة مضافة بالفعل"
-            
-            channels = [c.to_dict() for c in user.channels]
-            channels.append(channel_data.to_dict())
-            
-            success = await self.update_user(user_id, channels=channels)
-            if success:
-                return True, f"✅ تم إضافة القناة بنجاح. لديك الآن {len(user.channels) + 1}/{max_channels} قنوات"
-            else:
-                return False, "❌ حدث خطأ في إضافة القناة"
-        except Exception as e:
-            logger.error(f"Error adding channel for user {user_id}: {e}")
-            return False, "❌ حدث خطأ في إضافة القناة"
-    
-    async def remove_channel(self, user_id: int, channel_id: int) -> bool:
-        """حذف قناة من مستخدم"""
-        try:
-            user = await self.get_user(user_id)
-            if not user:
-                return False
-            
-            channels = [c.to_dict() for c in user.channels if c.id != channel_id]
-            return await self.update_user(user_id, channels=channels)
-        except Exception as e:
-            logger.error(f"Error removing channel for user {user_id}: {e}")
-            return False
-    
-    async def update_settings(self, user_id: int, setting: str, value: bool) -> bool:
-        """تحديث إعدادات المستخدم"""
-        try:
-            user = await self.get_user(user_id)
-            if not user:
-                return False
-            
-            settings = user.settings.to_dict()
-            settings[setting] = value
-            
-            return await self.update_user(user_id, settings=settings)
-        except Exception as e:
-            logger.error(f"Error updating settings for user {user_id}: {e}")
-            return False
-    
-    async def activate_vip(self, user_id: int, days: int) -> bool:
-        """تفعيل VIP لمستخدم (للمدير)"""
-        try:
-            user = await self.get_user(user_id)
-            if not user:
-                return False
-            
-            now = datetime.now(TIMEZONE)
-            current_expiry = user.expiry_date
-            
-            if current_expiry < now:
-                new_expiry = now + timedelta(days=days)
-            else:
-                new_expiry = current_expiry + timedelta(days=days)
-            
-            return await self.update_user(
-                user_id, 
-                expiry_date=new_expiry.isoformat(),
-                is_vip=True,
-                total_payments=user.total_payments + 1
-            )
-        except Exception as e:
-            logger.error(f"Error activating VIP for user {user_id}: {e}")
-            return False
-    
-    async def get_statistics(self) -> Dict[str, Any]:
-        """الحصول على إحصائيات البوت"""
-        users = await self.get_all_users()
-        now = datetime.now(TIMEZONE)
-        
-        total_users = len(users)
-        vip_users = sum(1 for u in users if u.is_vip)
-        active_users = sum(1 for u in users if u.expiry_date > now and u.is_active and not u.is_banned)
-        expired_users = sum(1 for u in users if u.expiry_date <= now and u.is_active and not u.is_banned)
-        banned_users = sum(1 for u in users if u.is_banned)
-        
-        today_start = datetime(now.year, now.month, now.day, tzinfo=TIMEZONE)
-        new_today = sum(1 for u in users if u.join_date >= today_start)
-        
-        total_channels = sum(len(u.channels) for u in users)
-        
-        return {
-            'total_users': total_users,
-            'vip_users': vip_users,
-            'active_users': active_users,
-            'expired_users': expired_users,
-            'banned_users': banned_users,
-            'new_today': new_today,
-            'total_channels': total_channels
-        }
-
-# ==================== تهيئة قاعدة البيانات ====================
-
-db = Database(SUPABASE_URL, SUPABASE_KEY)
-
-# ==================== أدوات مساعدة ====================
+# ==================== الدوال المساعدة ====================
 
 class Helpers:
-    """كلاس للأدوات المساعدة"""
+    """دوال مساعدة متنوعة"""
     
     @staticmethod
-    def format_date(date: datetime) -> str:
-        """تنسيق التاريخ"""
-        if not date:
-            return "غير معروف"
-        return date.strftime("%Y-%m-%d %H:%M")
+    def generate_code(length: int = 8) -> str:
+        """توليد كود عشوائي"""
+        chars = string.ascii_letters + string.digits
+        return ''.join(random.choice(chars) for _ in range(length))
     
     @staticmethod
-    def format_remaining_days(expiry_date: datetime) -> str:
-        """تنسيق الأيام المتبقية"""
-        now = datetime.now(TIMEZONE)
-        if expiry_date <= now:
-            return "منتهي"
-        
-        delta = expiry_date - now
-        days = delta.days
-        hours = delta.seconds // 3600
-        
-        if days > 0:
-            return f"{days} يوم و {hours} ساعة"
-        else:
-            return f"{hours} ساعة"
+    def format_number(num: int) -> str:
+        """تنسيق الأرقام"""
+        if num >= 1_000_000:
+            return f"{num/1_000_000:.1f}M"
+        elif num >= 1_000:
+            return f"{num/1_000:.1f}K"
+        return str(num)
     
     @staticmethod
-    def extract_channel_username(link: str) -> Optional[str]:
-        """استخراج يوزر القناة من الرابط"""
-        patterns = [
-            r't\.me/([a-zA-Z0-9_]+)',
-            r'telegram\.me/([a-zA-Z0-9_]+)',
-            r'@([a-zA-Z0-9_]+)'
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, link)
-            if match:
-                return match.group(1)
+    def extract_username(text: str) -> Optional[str]:
+        """استخراج اسم المستخدم من النص"""
+        match = re.search(r'@(\w+)', text)
+        return match.group(1) if match else None
+    
+    @staticmethod
+    def extract_channel_id(text: str) -> Optional[str]:
+        """استخراج معرف القناة"""
+        # للروابط
+        if 't.me/' in text:
+            parts = text.split('t.me/')
+            if len(parts) > 1:
+                return parts[1].split('/')[0]
+        # للمعرفات
+        elif text.startswith('@'):
+            return text[1:]
+        # للأرقام
+        elif text.startswith('-100'):
+            return text
         return None
+    
+    @staticmethod
+    async def check_membership(user_id: int, channel_id: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """التحقق من عضوية المستخدم في قناة"""
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+        except:
+            return False
+    
+    @staticmethod
+    async def safe_send_message(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE, **kwargs) -> bool:
+        """إرسال رسالة بشكل آمن"""
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return True
+        except Exception as e:
+            logger.error(f"Error sending message to {chat_id}: {e}")
+            return False
+    
+    @staticmethod
+    def parse_txt_file(file_content: str) -> List[str]:
+        """تحليل ملف txt واستخراج الأرقام"""
+        lines = file_content.strip().split('\n')
+        numbers = []
+        for line in lines:
+            # تنظيف الرقم من المسافات والرموز غير المرغوب فيها
+            num = re.sub(r'[^\d+]', '', line.strip())
+            if num and len(num) >= 10:  # رقم صحيح
+                numbers.append(num)
+        return numbers
+    
+    @staticmethod
+    def calculate_cost(members_count: int, cost_per_member: int) -> int:
+        """حساب تكلفة التمويل"""
+        return members_count * cost_per_member
+    
+    @staticmethod
+    def create_backup() -> str:
+        """إنشاء نسخة احتياطية من قاعدة البيانات"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_file = BACKUP_DIR / f"backup_{timestamp}.db"
+        shutil.copy2(db.db_path, backup_file)
+        return str(backup_file)
 
 helpers = Helpers()
 
-# ==================== لوحة المفاتيح ====================
+# ==================== إدارة المستخدمين ====================
 
-class Keyboards:
-    """كلاس لوحات المفاتيح"""
+class UserManager:
+    """إدارة المستخدمين"""
     
     @staticmethod
-    def main_menu(user_id: int, is_vip: bool = False) -> InlineKeyboardMarkup:
-        """لوحة المفاتيح الرئيسية"""
-        keyboard = []
+    async def get_or_create_user(user: Update.effective_user) -> Dict:
+        """الحصول على المستخدم أو إنشائه"""
+        user_id = user.id
+        username = user.username or ""
+        first_name = user.first_name or ""
+        last_name = user.last_name or ""
         
-        # زر إضافة قناة
-        keyboard.append([InlineKeyboardButton("📢 إضافة قناة جديدة", callback_data="add_channel")])
-        
-        # زر قنواتي (إذا وجدت قنوات)
-        # سنتحقق من وجود قنوات عند الاستدعاء
-        
-        # أزرار التحكم
-        keyboard.extend([
-            [
-                InlineKeyboardButton("🚫 حظر المنضمين", callback_data="toggle_ban_new_members"),
-                InlineKeyboardButton("🚫 حظر المغادرين", callback_data="toggle_ban_leavers")
-            ],
-            [
-                InlineKeyboardButton("🚫 حظر بدون يوزر", callback_data="toggle_ban_no_username")
-            ],
-            [
-                InlineKeyboardButton("⭐ اشتراك VIP", callback_data="vip_menu"),
-                InlineKeyboardButton("📞 تواصل معنا", url=f"https://t.me/{ADMIN_USERNAME}")
-            ]
-        ])
-        
-        # زر لوحة التحكم للمدير
-        if user_id == ADMIN_ID:
-            keyboard.append([InlineKeyboardButton("⚙️ لوحة التحكم", callback_data="admin_panel")])
-        
-        return InlineKeyboardMarkup(keyboard)
-    
-    @staticmethod
-    def vip_menu() -> InlineKeyboardMarkup:
-        """قائمة VIP"""
-        keyboard = [
-            [InlineKeyboardButton("💫 شراء اشتراك VIP", callback_data="buy_vip")],
-            [InlineKeyboardButton("ℹ️ مميزات VIP", callback_data="vip_features")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-    
-    @staticmethod
-    def admin_panel() -> InlineKeyboardMarkup:
-        """لوحة تحكم المدير"""
-        keyboard = [
-            [InlineKeyboardButton("📊 إحصائيات شاملة", callback_data="admin_stats")],
-            [InlineKeyboardButton("💰 تغيير سعر VIP", callback_data="admin_change_price")],
-            [InlineKeyboardButton("🔧 وضع الصيانة", callback_data="admin_maintenance")],
-            [InlineKeyboardButton("📢 إذاعة للجميع", callback_data="admin_broadcast")],
-            [InlineKeyboardButton("👥 إدارة المستخدمين", callback_data="admin_users")],
-            [InlineKeyboardButton("⭐ تفعيل VIP", callback_data="admin_activate_vip")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-    
-    @staticmethod
-    def channels_menu(channels: List[ChannelData], page: int = 0, items_per_page: int = 5) -> InlineKeyboardMarkup:
-        """قائمة القنوات مع ترقيم الصفحات"""
-        keyboard = []
-        
-        start = page * items_per_page
-        end = start + items_per_page
-        page_channels = channels[start:end]
-        
-        for channel in page_channels:
-            btn_text = f"❌ {channel.title[:20]}"
-            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"delete_channel_{channel.id}")])
-        
-        # أزرار الترقيم
-        nav_buttons = []
-        if page > 0:
-            nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"channels_page_{page-1}"))
-        if end < len(channels):
-            nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"channels_page_{page+1}"))
-        
-        if nav_buttons:
-            keyboard.append(nav_buttons)
-        
-        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")])
-        
-        return InlineKeyboardMarkup(keyboard)
-    
-    @staticmethod
-    def confirm_keyboard(action: str) -> InlineKeyboardMarkup:
-        """لوحة تأكيد"""
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ نعم", callback_data=f"confirm_{action}"),
-                InlineKeyboardButton("❌ لا", callback_data=f"cancel_{action}")
-            ]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-
-# ==================== معالجي الأوامر ====================
-
-class CommandHandlers:
-    """معالجي الأوامر"""
-    
-    @staticmethod
-    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج أمر /start"""
-        user = update.effective_user
-        
-        try:
-            db_user = await db.get_or_create_user(user.id, user.username, user.first_name)
-            
-            if db_user.is_banned:
-                await update.message.reply_text(
-                    "⛔ لقد تم حظرك من استخدام البوت.\n"
-                    f"للتواصل مع الدعم: @{ADMIN_USERNAME}"
-                )
-                return
-            
-            is_active = db_user.expiry_date > datetime.now(TIMEZONE)
-            remaining = helpers.format_remaining_days(db_user.expiry_date)
-            
-            # رسالة الترحيب مع طلب الاشتراك المباشر
-            welcome_text = (
-                f"👋 أهلاً بك {db_user.first_name} في بوت حماية القنوات!\n\n"
-                f"📊 حالتك الحالية:\n"
-                f"{'✅' if is_active else '❌'} الاشتراك: {'نشط' if is_active else 'منتهي'}\n"
-                f"⏱ المتبقي: {remaining}\n"
-                f"{'⭐' if db_user.is_vip else '💫'} النوع: {'VIP' if db_user.is_vip else 'مجاني'}\n"
-                f"📢 القنوات: {len(db_user.channels)}/{MAX_VIP_CHANNELS if db_user.is_vip else MAX_FREE_CHANNELS}\n\n"
-                f"🎁 لقد حصلت على {FREE_TRIAL_DAYS} يوم هدية!\n\n"
-                f"💬 للاشتراك VIP: اضغط على زر 'اشتراك VIP' ثم تواصل مع @{ADMIN_USERNAME}"
-            )
-            
-            await update.message.reply_text(
-                welcome_text,
-                reply_markup=Keyboards.main_menu(user.id, db_user.is_vip)
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in start command: {e}")
-            await update.message.reply_text("❌ حدث خطأ. الرجاء المحاولة لاحقاً.")
-    
-    @staticmethod
-    async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج الضغط على الأزرار"""
-        query = update.callback_query
-        await query.answer()
-        
-        user = update.effective_user
-        data = query.data
-        
-        try:
-            db_user = await db.get_or_create_user(user.id, user.username, user.first_name)
-            
-            if db_user.is_banned and user.id != ADMIN_ID:
-                await query.edit_message_text("⛔ أنت محظور من استخدام البوت.")
-                return
-            
-            if data == "back_to_main":
-                await CommandHandlers.show_main_menu(update, context)
-            
-            elif data == "add_channel":
-                await CommandHandlers.add_channel_start(update, context)
-            
-            elif data == "my_channels":
-                await CommandHandlers.show_channels(update, context)
-            
-            elif data.startswith("channels_page_"):
-                page = int(data.split("_")[2])
-                await CommandHandlers.show_channels(update, context, page)
-            
-            elif data.startswith("delete_channel_"):
-                channel_id = int(data.split("_")[2])
-                context.user_data['channel_to_delete'] = channel_id
-                await query.edit_message_text(
-                    "🗑 هل أنت متأكد من حذف هذه القناة؟",
-                    reply_markup=Keyboards.confirm_keyboard("delete_channel")
-                )
-            
-            elif data == "confirm_delete_channel":
-                channel_id = context.user_data.get('channel_to_delete')
-                if channel_id:
-                    await db.remove_channel(user.id, channel_id)
-                    await query.edit_message_text(
-                        "✅ تم حذف القناة بنجاح",
-                        reply_markup=Keyboards.main_menu(user.id, db_user.is_vip)
-                    )
-            
-            elif data == "cancel_delete_channel":
-                await query.edit_message_text(
-                    "تم إلغاء الحذف",
-                    reply_markup=Keyboards.main_menu(user.id, db_user.is_vip)
-                )
-            
-            elif data.startswith("toggle_"):
-                setting = data.replace("toggle_", "")
-                current_value = getattr(db_user.settings, setting, False)
-                new_value = not current_value
-                
-                await db.update_settings(user.id, setting, new_value)
-                
-                setting_names = {
-                    'ban_new_members': 'حظر المنضمين',
-                    'ban_leavers': 'حظر المغادرين',
-                    'ban_no_username': 'حظر بدون يوزر'
-                }
-                
-                await query.edit_message_text(
-                    f"✅ تم {'تفعيل' if new_value else 'تعطيل'} {setting_names.get(setting, setting)}",
-                    reply_markup=Keyboards.main_menu(user.id, db_user.is_vip)
-                )
-            
-            elif data == "vip_menu":
-                await CommandHandlers.vip_menu(update, context)
-            
-            elif data == "buy_vip":
-                await query.edit_message_text(
-                    f"💫 **للاشتراك VIP:**\n\n"
-                    f"1️⃣ السعر: {VIP_PRICE} نجمة تليجرام\n"
-                    f"2️⃣ المدة: {VIP_DAYS} يوم\n"
-                    f"3️⃣ المميزات: {MAX_VIP_CHANNELS} قنوات\n\n"
-                    f"📞 **للشراء، تواصل مع المسؤول:**\n"
-                    f"@{ADMIN_USERNAME}\n\n"
-                    f"⚠️ أرسل له رسالة تحتوي على:\n"
-                    f"`مرحبا اريد اشتراك بالبوت شنو السعر`",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("💬 مراسلة المسؤول", url=f"https://t.me/{ADMIN_USERNAME}")],
-                        [InlineKeyboardButton("📋 نسخ الرسالة", callback_data="copy_message")],
-                        [InlineKeyboardButton("🔙 رجوع", callback_data="vip_menu")]
-                    ])
-                )
-            
-            elif data == "copy_message":
-                await query.answer("تم النسخ! أرسل الرسالة للمسؤول", show_alert=True)
-                # نسخ الرسالة للحافظة - المستخدم ينسخها يدوياً
-            
-            elif data == "vip_features":
-                text = (
-                    "🌟 **مميزات الاشتراك VIP** 🌟\n\n"
-                    f"• إضافة حتى **{MAX_VIP_CHANNELS}** قنوات\n"
-                    f"• مدة الاشتراك: **{VIP_DAYS}** يوم\n"
-                    "• دعم فني متميز\n"
-                    "• أولوية في المعالجة\n"
-                    "• مميزات حصرية قادمة\n\n"
-                    f"💰 السعر: **{VIP_PRICE}** نجمة تليجرام"
-                )
-                await query.edit_message_text(
-                    text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=Keyboards.vip_menu()
-                )
-            
-            elif data == "admin_panel" and user.id == ADMIN_ID:
-                await CommandHandlers.admin_panel(update, context)
-            
-            elif data == "admin_stats" and user.id == ADMIN_ID:
-                await CommandHandlers.admin_stats(update, context)
-            
-            elif data == "admin_change_price" and user.id == ADMIN_ID:
-                await query.edit_message_text(
-                    f"💰 **تغيير سعر VIP**\n\n"
-                    f"السعر الحالي: {VIP_PRICE} نجمة\n\n"
-                    "أرسل السعر الجديد (رقم فقط):",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔙 إلغاء", callback_data="admin_panel")
-                    ]])
-                )
-                context.user_data['awaiting_price'] = True
-                return CHANGE_PRICE_WAITING
-            
-            elif data == "admin_maintenance" and user.id == ADMIN_ID:
-                current_mode = context.bot_data.get('maintenance_mode', False)
-                
-                if current_mode:
-                    context.bot_data['maintenance_mode'] = False
-                    text = "✅ تم إيقاف وضع الصيانة. البوت يعمل بشكل طبيعي."
-                else:
-                    context.bot_data['maintenance_mode'] = True
-                    text = "🔧 تم تفعيل وضع الصيانة. المستخدمون العاديون لا يمكنهم استخدام البوت."
-                
-                await query.edit_message_text(text, reply_markup=Keyboards.admin_panel())
-            
-            elif data == "admin_broadcast" and user.id == ADMIN_ID:
-                await query.edit_message_text(
-                    "📢 **إذاعة للجميع**\n\n"
-                    "أرسل الرسالة التي تريد إذاعتها (نص، صورة، فيديو، ...)\n\n"
-                    "لإلغاء: /cancel",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔙 إلغاء", callback_data="admin_panel")
-                    ]])
-                )
-                context.user_data['awaiting_broadcast'] = True
-                return BROADCAST_WAITING_MESSAGE
-            
-            elif data == "admin_users" and user.id == ADMIN_ID:
-                users = await db.get_all_users()
-                users.sort(key=lambda x: x.join_date, reverse=True)
-                
-                text = "👥 **آخر 10 مستخدمين:**\n\n"
-                
-                for i, u in enumerate(users[:10], 1):
-                    status = "✅" if u.expiry_date > datetime.now(TIMEZONE) else "❌"
-                    vip = "⭐" if u.is_vip else "💫"
-                    text += f"{i}. {vip} {u.first_name[:15]} - `{u.user_id}`\n"
-                    text += f"   • الحالة: {status}\n"
-                    text += f"   • القنوات: {len(u.channels)}\n\n"
-                
-                keyboard = [
-                    [InlineKeyboardButton("⭐ تفعيل VIP", callback_data="admin_activate_vip")],
-                    [InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]
-                ]
-                
-                await query.edit_message_text(
-                    text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            
-            elif data == "admin_activate_vip" and user.id == ADMIN_ID:
-                await query.edit_message_text(
-                    "⭐ **تفعيل VIP لمستخدم**\n\n"
-                    "أرسل **ايدي المستخدم** (رقم فقط):\n"
-                    "مثال: `123456789`\n\n"
-                    "للإلغاء: /cancel",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔙 إلغاء", callback_data="admin_panel")
-                    ]])
-                )
-                context.user_data['awaiting_activate_user'] = True
-                return ACTIVATE_VIP_WAITING_USER_ID
-            
-        except Exception as e:
-            logger.error(f"Error in callback handler: {e}")
-            await query.edit_message_text("❌ حدث خطأ. الرجاء المحاولة لاحقاً.")
-    
-    @staticmethod
-    async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """عرض القائمة الرئيسية"""
-        query = update.callback_query
-        user_id = update.effective_user.id
-        
-        db_user = await db.get_user(user_id)
-        
-        # التحقق من وجود قنوات لإظهار زر "قنواتي"
-        keyboard = []
-        keyboard.append([InlineKeyboardButton("📢 إضافة قناة جديدة", callback_data="add_channel")])
-        
-        if db_user and db_user.channels:
-            channels_text = f"📋 قنواتي ({len(db_user.channels)}/{MAX_VIP_CHANNELS if db_user.is_vip else MAX_FREE_CHANNELS})"
-            keyboard.append([InlineKeyboardButton(channels_text, callback_data="my_channels")])
-        
-        keyboard.extend([
-            [
-                InlineKeyboardButton("🚫 حظر المنضمين", callback_data="toggle_ban_new_members"),
-                InlineKeyboardButton("🚫 حظر المغادرين", callback_data="toggle_ban_leavers")
-            ],
-            [
-                InlineKeyboardButton("🚫 حظر بدون يوزر", callback_data="toggle_ban_no_username")
-            ],
-            [
-                InlineKeyboardButton("⭐ اشتراك VIP", callback_data="vip_menu"),
-                InlineKeyboardButton("📞 تواصل معنا", url=f"https://t.me/{ADMIN_USERNAME}")
-            ]
-        ])
-        
-        if user_id == ADMIN_ID:
-            keyboard.append([InlineKeyboardButton("⚙️ لوحة التحكم", callback_data="admin_panel")])
-        
-        await query.edit_message_text(
-            "القائمة الرئيسية",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    
-    @staticmethod
-    async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """بدء إضافة قناة"""
-        query = update.callback_query
-        user_id = update.effective_user.id
-        
-        db_user = await db.get_user(user_id)
-        max_channels = MAX_VIP_CHANNELS if db_user and db_user.is_vip else MAX_FREE_CHANNELS
-        
-        if db_user and len(db_user.channels) >= max_channels:
-            await query.edit_message_text(
-                f"❌ لقد وصلت للحد الأقصى ({max_channels} قنوات)\n"
-                f"قم بحذف قناة قديمة أو اشترك VIP",
-                reply_markup=Keyboards.main_menu(user_id, db_user.is_vip)
-            )
-            return
-        
-        await query.edit_message_text(
-            "📝 **إضافة قناة جديدة**\n\n"
-            "أرسل رابط القناة:\n"
-            "مثال: `https://t.me/username`\n\n"
-            "📌 **شروط الإضافة:**\n"
-            "• البوت مشرف في القناة بكل الصلاحيات\n"
-            "• الرابط صحيح\n\n"
-            "للإلغاء: /cancel",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 إلغاء", callback_data="back_to_main")
-            ]])
+        # التحقق من وجود المستخدم
+        existing = db.execute_query(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+            fetch_one=True
         )
         
-        context.user_data['awaiting_channel'] = True
-        return ADD_CHANNEL_WAITING_LINK
-    
-    @staticmethod
-    async def handle_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج رابط القناة"""
-        if not context.user_data.get('awaiting_channel'):
-            return
-        
-        message = update.message
-        user_id = update.effective_user.id
-        link = message.text.strip()
-        
-        channel_username = helpers.extract_channel_username(link)
-        if not channel_username:
-            await message.reply_text(
-                "❌ رابط غير صحيح!\nأرسل رابط صحيح مثل: https://t.me/username",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 إلغاء", callback_data="back_to_main")
-                ]])
+        if existing:
+            # تحديث آخر نشاط
+            db.execute_query(
+                "UPDATE users SET last_active = CURRENT_TIMESTAMP, username = ?, first_name = ?, last_name = ? WHERE user_id = ?",
+                (username, first_name, last_name, user_id)
             )
-            return
-        
-        status_msg = await message.reply_text(f"🔍 جاري التحقق من القناة @{channel_username}...")
-        
-        try:
-            chat = await context.bot.get_chat(f"@{channel_username}")
-            
-            bot_member = await chat.get_member(context.bot.id)
-            
-            if bot_member.status not in ['administrator', 'creator']:
-                await status_msg.edit_text(
-                    f"❌ البوت ليس مشرفاً في @{channel_username}\n"
-                    "الرجاء رفع البوت مشرفاً ثم حاول مرة أخرى",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔙 إلغاء", callback_data="back_to_main")
-                    ]])
-                )
-                return
-            
-            if not bot_member.can_delete_messages:
-                await status_msg.edit_text(
-                    "❌ البوت لا يملك صلاحية حذف الرسائل\n"
-                    "الرجاء إعطاء البوت جميع الصلاحيات",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔙 إلغاء", callback_data="back_to_main")
-                    ]])
-                )
-                return
-            
-            channel_data = ChannelData(
-                id=chat.id,
-                link=link,
-                title=chat.title or channel_username,
-                added_date=datetime.now(TIMEZONE),
-                is_active=True
-            )
-            
-            success, result_text = await db.add_channel(user_id, channel_data)
-            
-            db_user = await db.get_user(user_id)
-            await status_msg.edit_text(
-                result_text,
-                reply_markup=Keyboards.main_menu(user_id, db_user.is_vip if db_user else False)
-            )
-            
-        except TelegramError as e:
-            logger.error(f"Error verifying channel: {e}")
-            await status_msg.edit_text(
-                "❌ حدث خطأ في التحقق من القناة\n"
-                "تأكد من:\n"
-                "• صحة رابط القناة\n"
-                "• رفع البوت كمشرف في القناة\n"
-                "• إعطاء البوت جميع الصلاحيات",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 إلغاء", callback_data="back_to_main")
-                ]])
-            )
-        
-        finally:
-            context.user_data['awaiting_channel'] = False
-    
-    @staticmethod
-    async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
-        """عرض قائمة القنوات"""
-        query = update.callback_query
-        user_id = update.effective_user.id
-        
-        db_user = await db.get_user(user_id)
-        if not db_user or not db_user.channels:
-            await query.edit_message_text(
-                "📭 لا توجد قنوات مضافة",
-                reply_markup=Keyboards.main_menu(user_id, db_user.is_vip if db_user else False)
-            )
-            return
-        
-        channels = db_user.channels
-        max_channels = MAX_VIP_CHANNELS if db_user.is_vip else MAX_FREE_CHANNELS
-        
-        text = f"📋 **قنواتك** ({len(channels)}/{max_channels}):\n\n"
-        
-        start = page * 5
-        end = min(start + 5, len(channels))
-        
-        for i, channel in enumerate(channels[start:end], start + 1):
-            text += f"{i}. **{channel.title}**\n"
-            text += f"   الرابط: {channel.link}\n"
-            text += f"   تاريخ الإضافة: {helpers.format_date(channel.added_date)}\n\n"
-        
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=Keyboards.channels_menu(channels, page)
-        )
-    
-    @staticmethod
-    async def vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """قائمة VIP"""
-        query = update.callback_query
-        user_id = update.effective_user.id
-        
-        db_user = await db.get_user(user_id)
-        is_vip = db_user and db_user.is_vip
-        
-        if is_vip:
-            remaining = helpers.format_remaining_days(db_user.expiry_date)
-            text = (
-                f"🌟 **أنت مشترك VIP** 🌟\n\n"
-                f"⏱ المتبقي: {remaining}\n"
-                f"📊 القنوات: {len(db_user.channels)}/{MAX_VIP_CHANNELS}\n\n"
-                f"شكراً لدعمك! 🙏"
-            )
+            return dict(existing)
         else:
-            text = (
-                "✨ **مميزات VIP** ✨\n\n"
-                f"• حتى **{MAX_VIP_CHANNELS}** قنوات\n"
-                f"• مدة الاشتراك: **{VIP_DAYS}** يوم\n"
-                "• دعم فني متميز\n\n"
-                f"💰 السعر: **{VIP_PRICE}** نجمة\n\n"
-                f"📞 للشراء، تواصل مع @{ADMIN_USERNAME}"
+            # إنشاء مستخدم جديد
+            db.execute_query("""
+                INSERT INTO users (user_id, username, first_name, last_name, points, joined_date)
+                VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+            """, (user_id, username, first_name, last_name))
+            
+            # إنشاء رابط دعوة
+            code = helpers.generate_code(10)
+            db.execute_query(
+                "INSERT INTO referral_links (user_id, link_code) VALUES (?, ?)",
+                (user_id, code)
             )
-        
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=Keyboards.vip_menu()
-        )
+            
+            new_user = db.execute_query(
+                "SELECT * FROM users WHERE user_id = ?",
+                (user_id,),
+                fetch_one=True
+            )
+            return dict(new_user)
     
     @staticmethod
-    async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """لوحة تحكم المدير"""
-        query = update.callback_query
-        
-        stats = await db.get_statistics()
-        
-        text = (
-            "⚙️ **لوحة التحكم**\n\n"
-            f"📊 إحصائيات سريعة:\n"
-            f"👥 إجمالي المستخدمين: {stats['total_users']}\n"
-            f"⭐ VIP: {stats['vip_users']}\n"
-            f"✅ نشطين: {stats['active_users']}\n"
-            f"📅 جديد اليوم: {stats['new_today']}\n\n"
-            "اختر من القائمة:"
+    def get_user(user_id: int) -> Optional[Dict]:
+        """الحصول على معلومات المستخدم"""
+        result = db.execute_query(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+            fetch_one=True
         )
-        
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=Keyboards.admin_panel()
-        )
+        return dict(result) if result else None
     
     @staticmethod
-    async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """عرض إحصائيات مفصلة"""
-        query = update.callback_query
-        stats = await db.get_statistics()
+    def update_points(user_id: int, amount: int, action: str, description: str = "") -> bool:
+        """تحديث نقاط المستخدم"""
+        user = UserManager.get_user(user_id)
+        if not user:
+            return False
         
-        text = (
-            "📊 **إحصائيات البوت**\n\n"
-            f"👥 إجمالي المستخدمين: {stats['total_users']}\n"
-            f"⭐ مستخدمين VIP: {stats['vip_users']}\n"
-            f"✅ مستخدمين نشطين: {stats['active_users']}\n"
-            f"❌ مستخدمين منتهيين: {stats['expired_users']}\n"
-            f"🚫 محظورين: {stats['banned_users']}\n"
-            f"📅 مستخدمين جدد اليوم: {stats['new_today']}\n"
-            f"📢 إجمالي القنوات: {stats['total_channels']}"
+        new_points = user['points'] + amount
+        if new_points < 0:
+            return False
+        
+        db.execute_query(
+            "UPDATE users SET points = ? WHERE user_id = ?",
+            (new_points, user_id)
         )
         
-        keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        # تسجيل الحركة
+        db.execute_query("""
+            INSERT INTO points_history (user_id, amount, action_type, description)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, amount, action, description))
+        
+        return True
     
     @staticmethod
-    async def handle_price_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج تغيير السعر"""
-        if not context.user_data.get('awaiting_price'):
-            return
+    def add_referral(user_id: int, referrer_id: int) -> bool:
+        """إضافة إحالة جديدة"""
+        # تحديث عدد الإحالات للمحيل
+        db.execute_query(
+            "UPDATE users SET referrals = referrals + 1 WHERE user_id = ?",
+            (referrer_id,)
+        )
         
-        message = update.message
+        # تحديث المحال
+        db.execute_query(
+            "UPDATE users SET referrer_id = ? WHERE user_id = ?",
+            (referrer_id, user_id)
+        )
+        
+        return True
+    
+    @staticmethod
+    def ban_user(user_id: int, admin_id: int, reason: str = "") -> bool:
+        """حظر مستخدم"""
+        if user_id in ADMIN_IDS:
+            return False
+        
+        db.execute_query(
+            "UPDATE users SET is_banned = 1 WHERE user_id = ?",
+            (user_id,)
+        )
+        
+        db.execute_query("""
+            INSERT OR REPLACE INTO banned_users (user_id, banned_by, reason)
+            VALUES (?, ?, ?)
+        """, (user_id, admin_id, reason))
+        
+        return True
+    
+    @staticmethod
+    def unban_user(user_id: int) -> bool:
+        """رفع الحظر عن مستخدم"""
+        db.execute_query(
+            "UPDATE users SET is_banned = 0 WHERE user_id = ?",
+            (user_id,)
+        )
+        
+        db.execute_query(
+            "DELETE FROM banned_users WHERE user_id = ?",
+            (user_id,)
+        )
+        
+        return True
+    
+    @staticmethod
+    def is_banned(user_id: int) -> bool:
+        """التحقق من حظر المستخدم"""
+        result = db.execute_query(
+            "SELECT is_banned FROM users WHERE user_id = ?",
+            (user_id,),
+            fetch_one=True
+        )
+        return bool(result and result['is_banned'])
+
+user_manager = UserManager()
+
+# ==================== إعدادات البوت ====================
+
+class BotSettings:
+    """إدارة إعدادات البوت"""
+    
+    @staticmethod
+    def get(key: str, default: Any = None) -> Any:
+        """الحصول على قيمة إعداد"""
+        result = db.execute_query(
+            "SELECT value FROM bot_settings WHERE key = ?",
+            (key,),
+            fetch_one=True
+        )
+        return result['value'] if result else default
+    
+    @staticmethod
+    def set(key: str, value: str) -> bool:
+        """تعيين قيمة إعداد"""
+        db.execute_query("""
+            INSERT OR REPLACE INTO bot_settings (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        """, (key, value))
+        return True
+    
+    @staticmethod
+    def get_welcome_message(user_id: int, username: str, points: int) -> str:
+        """الحصول على رسالة الترحيب المنسقة"""
+        template = BotSettings.get('welcome_message', 
+            "👋 مرحباً بك في بوت التمويل!\nنقاطك: {points}\nايديك: {user_id}\n@{username}")
+        return template.format(user_id=user_id, username=username, points=points)
+    
+    @staticmethod
+    def get_referral_reward() -> int:
+        """مكافأة الدعوة"""
+        return int(BotSettings.get('referral_reward', '10'))
+    
+    @staticmethod
+    def get_member_cost() -> int:
+        """تكلفة العضو الواحد"""
+        return int(BotSettings.get('member_cost', '8'))
+    
+    @staticmethod
+    def get_support_username() -> str:
+        """اسم مستخدم الدعم"""
+        return BotSettings.get('support_username', 'support_bot')
+    
+    @staticmethod
+    def get_channel_username() -> str:
+        """اسم مستخدم القناة"""
+        return BotSettings.get('channel_username', 'channel_username')
+
+settings = BotSettings()
+
+# ==================== القنوات الإجبارية ====================
+
+class ForceChannelManager:
+    """إدارة القنوات الإجبارية"""
+    
+    @staticmethod
+    def add_channel(channel_id: str, channel_username: str, channel_title: str, added_by: int) -> bool:
+        """إضافة قناة إجبارية"""
         try:
-            global VIP_PRICE
-            new_price = int(message.text.strip())
-            if new_price < 1:
-                await message.reply_text("❌ السعر يجب أن يكون أكبر من 0")
-                return
-            
-            VIP_PRICE = new_price
-            
-            await message.reply_text(
-                f"✅ تم تغيير السعر إلى {new_price} نجمة",
-                reply_markup=Keyboards.admin_panel()
-            )
-            
-        except ValueError:
-            await message.reply_text("❌ الرجاء إرسال رقم صحيح")
-        finally:
-            context.user_data['awaiting_price'] = False
+            db.execute_query("""
+                INSERT OR REPLACE INTO force_channels (channel_id, channel_username, channel_title, added_by)
+                VALUES (?, ?, ?, ?)
+            """, (channel_id, channel_username, channel_title, added_by))
+            return True
+        except:
+            return False
     
     @staticmethod
-    async def handle_activate_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج تفعيل VIP"""
-        message = update.message
-        user_id = update.effective_user.id
+    def remove_channel(channel_id: str) -> bool:
+        """حذف قناة إجبارية"""
+        db.execute_query(
+            "DELETE FROM force_channels WHERE channel_id = ?",
+            (channel_id,)
+        )
+        return True
+    
+    @staticmethod
+    def get_all_channels() -> List[Dict]:
+        """الحصول على جميع القنوات الإجبارية النشطة"""
+        results = db.execute_query(
+            "SELECT * FROM force_channels WHERE is_active = 1 ORDER BY added_date DESC"
+        )
+        return [dict(row) for row in results]
+    
+    @staticmethod
+    async def check_all_memberships(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool, List[Dict]]:
+        """التحقق من عضوية المستخدم في جميع القنوات"""
+        channels = ForceChannelManager.get_all_channels()
+        not_joined = []
         
-        if user_id != ADMIN_ID:
-            return
+        for channel in channels:
+            is_member = await helpers.check_membership(user_id, channel['channel_id'], context)
+            if not is_member:
+                not_joined.append(channel)
         
-        # استقبال ايدي المستخدم
-        if context.user_data.get('awaiting_activate_user'):
-            try:
-                target_user_id = int(message.text.strip())
-                context.user_data['activate_user_id'] = target_user_id
-                context.user_data['awaiting_activate_user'] = False
-                context.user_data['awaiting_activate_days'] = True
-                
-                await message.reply_text(
-                    f"✅ تم استلام ايدي المستخدم: `{target_user_id}`\n\n"
-                    "الآن أرسل **عدد الأيام** لتفعيل الاشتراك:\n"
-                    "مثال: `30`",
-                    parse_mode=ParseMode.MARKDOWN
+        return len(not_joined) == 0, not_joined
+    
+    @staticmethod
+    def get_channels_keyboard() -> InlineKeyboardMarkup:
+        """الحصول على لوحة مفاتيح القنوات"""
+        channels = ForceChannelManager.get_all_channels()
+        keyboard = []
+        
+        for channel in channels:
+            if channel['channel_username']:
+                url = f"https://t.me/{channel['channel_username']}"
+                keyboard.append([InlineKeyboardButton(f"📢 {channel['channel_title']}", url=url)])
+        
+        keyboard.append([InlineKeyboardButton("✅ تم الاشتراك", callback_data="check_subscription")])
+        
+        return InlineKeyboardMarkup(keyboard)
+
+force_manager = ForceChannelManager()
+
+# ==================== إدارة التمويل ====================
+
+class FundingManager:
+    """إدارة عمليات التمويل"""
+    
+    def __init__(self):
+        self.active_funding = {}  # تخزين عمليات التمويل النشطة مؤقتاً
+        self.user_requests = defaultdict(dict)  # تخزين طلبات المستخدمين المؤقتة
+    
+    async def start_funding(self, user_id: int, members_count: int, chat_link: str, context: ContextTypes.DEFAULT_TYPE):
+        """بدء عملية تمويل جديدة"""
+        try:
+            # التحقق من صحة الرابط
+            chat_info = await self.extract_chat_info(chat_link, context)
+            if not chat_info:
+                await helpers.safe_send_message(
+                    user_id,
+                    "❌ الرابط غير صحيح. تأكد من أن البوت مشرف في القناة وأن الرابط صحيح.",
+                    context
                 )
-                return ACTIVATE_VIP_WAITING_DAYS
-                
-            except ValueError:
-                await message.reply_text("❌ ايدي غير صحيح! أرسل رقماً فقط")
-                return
-        
-        # استقبال عدد الأيام
-        if context.user_data.get('awaiting_activate_days'):
+                return False
+            
+            # حساب التكلفة
+            cost = helpers.calculate_cost(members_count, settings.get_member_cost())
+            
+            # التحقق من رصيد المستخدم
+            user = user_manager.get_user(user_id)
+            if user['points'] < cost:
+                await helpers.safe_send_message(
+                    user_id,
+                    f"❌ رصيدك غير كافٍ!\n"
+                    f"المطلوب: {cost} نقطة\n"
+                    f"رصيدك: {user['points']} نقطة",
+                    context
+                )
+                return False
+            
+            # التحقق من توفر أرقام كافية
+            available = stats.get_available_numbers()
+            if available < members_count:
+                await helpers.safe_send_message(
+                    user_id,
+                    f"❌ لا يوجد عدد كافٍ من الأرقام المتاحة!\n"
+                    f"المتاح: {available}\n"
+                    f"المطلوب: {members_count}",
+                    context
+                )
+                return False
+            
+            # خصم النقاط
+            user_manager.update_points(user_id, -cost, "funding", f"تمويل {members_count} عضو")
+            
+            # إنشاء طلب تمويل
+            request_id = db.execute_insert("""
+                INSERT INTO funding_requests 
+                (user_id, chat_id, chat_title, members_count, cost_points, remaining_count, chat_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                user_id,
+                chat_info['chat_id'],
+                chat_info['title'],
+                members_count,
+                cost,
+                members_count,
+                chat_info['type']
+            ))
+            
+            # بدء عملية التمويل
+            asyncio.create_task(self.process_funding(request_id, user_id, chat_info, members_count, context))
+            
+            # إشعار المستخدم
+            await helpers.safe_send_message(
+                user_id,
+                f"✅ تم بدء عملية التمويل بنجاح!\n"
+                f"📊 عدد الأعضاء: {members_count}\n"
+                f"💰 التكلفة: {cost} نقطة\n"
+                f"⏳ سيتم إعلامك عند إضافة كل عضو.",
+                context
+            )
+            
+            # إشعار المشرفين
+            await self.notify_admins_new_funding(request_id, user_id, chat_info, members_count, cost, context)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error in start_funding: {e}")
+            await helpers.safe_send_message(
+                user_id,
+                "❌ حدث خطأ أثناء بدء عملية التمويل. يرجى المحاولة لاحقاً.",
+                context
+            )
+            return False
+    
+    async def extract_chat_info(self, link: str, context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict]:
+        """استخراج معلومات القناة/المجموعة من الرابط"""
+        try:
+            chat_username = helpers.extract_channel_id(link)
+            if not chat_username:
+                return None
+            
+            # محاولة الحصول على معلومات القناة
             try:
-                days = int(message.text.strip())
-                if days < 1:
-                    await message.reply_text("❌ عدد الأيام يجب أن يكون أكبر من 0")
-                    return
+                chat = await context.bot.get_chat(chat_username)
+            except:
+                # محاولة كـ @username
+                if not chat_username.startswith('@'):
+                    chat_username = f"@{chat_username}"
+                try:
+                    chat = await context.bot.get_chat(chat_username)
+                except:
+                    return None
+            
+            return {
+                'chat_id': str(chat.id),
+                'username': chat.username or "",
+                'title': chat.title or "Unknown",
+                'type': chat.type
+            }
+        except Exception as e:
+            logger.error(f"Error extracting chat info: {e}")
+            return None
+    
+    async def process_funding(self, request_id: int, user_id: int, chat_info: Dict, 
+                            total_members: int, context: ContextTypes.DEFAULT_TYPE):
+        """معالجة عملية التمويل (إضافة الأعضاء)"""
+        try:
+            added = 0
+            chat_id = chat_info['chat_id']
+            
+            while added < total_members:
+                # الحصول على رقم غير مستخدم
+                number = self.get_unused_number(request_id)
+                if not number:
+                    # لا يوجد أرقام كافية
+                    await helpers.safe_send_message(
+                        user_id,
+                        f"⚠️ توقف التمويل: نفذت الأرقام المتاحة!\n"
+                        f"تم إضافة {added} من أصل {total_members} عضو.",
+                        context
+                    )
+                    break
                 
-                target_user_id = context.user_data.get('activate_user_id')
-                
-                # تفعيل VIP
-                success = await db.activate_vip(target_user_id, days)
+                # محاولة إضافة العضو
+                success = await self.add_member_to_chat(chat_id, number['phone_number'], context)
                 
                 if success:
-                    # إرسال إشعار للمستخدم المستهدف
-                    try:
-                        await context.bot.send_message(
-                            target_user_id,
-                            f"✅ **تم تفعيل اشتراك VIP لك!**\n\n"
-                            f"📅 المدة: {days} يوم\n"
-                            f"⭐ القنوات المسموحة: {MAX_VIP_CHANNELS}\n\n"
-                            f"شكراً لدعمك! 🙏",
-                            parse_mode=ParseMode.MARKDOWN
-                        )
-                    except:
-                        pass
+                    added += 1
                     
-                    await message.reply_text(
-                        f"✅ **تم تفعيل VIP للمستخدم**\n\n"
-                        f"👤 ايدي المستخدم: `{target_user_id}`\n"
-                        f"📅 المدة: {days} يوم\n"
-                        f"✅ تم إرسال إشعار للمستخدم",
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=Keyboards.admin_panel()
-                    )
-                else:
-                    await message.reply_text(
-                        "❌ فشل في تفعيل VIP. المستخدم غير موجود؟",
-                        reply_markup=Keyboards.admin_panel()
-                    )
+                    # تحديث حالة الرقم
+                    db.execute_query("""
+                        UPDATE funding_numbers 
+                        SET is_used = 1, used_date = CURRENT_TIMESTAMP, used_in_request = ?
+                        WHERE id = ?
+                    """, (request_id, number['id']))
+                    
+                    # تحديث طلب التمويل
+                    db.execute_query("""
+                        UPDATE funding_requests 
+                        SET added_count = ?, remaining_count = ?
+                        WHERE request_id = ?
+                    """, (added, total_members - added, request_id))
+                    
+                    # إرسال إشعار كل 5 أعضاء
+                    if added % 5 == 0 or added == total_members:
+                        await helpers.safe_send_message(
+                            user_id,
+                            f"📊 تقدم التمويل:\n"
+                            f"تم إضافة: {added}\n"
+                            f"المتبقي: {total_members - added}",
+                            context
+                        )
                 
-            except ValueError:
-                await message.reply_text("❌ عدد الأيام غير صحيح! أرسل رقماً فقط")
-            finally:
-                context.user_data['awaiting_activate_days'] = False
-                context.user_data['activate_user_id'] = None
+                # تأخير لتجنب سبام
+                await asyncio.sleep(random.uniform(2, 5))
+            
+            # اكتمال التمويل
+            if added >= total_members:
+                db.execute_query("""
+                    UPDATE funding_requests 
+                    SET status = 'completed', completed_at = CURRENT_TIMESTAMP
+                    WHERE request_id = ?
+                """, (request_id,))
+                
+                await helpers.safe_send_message(
+                    user_id,
+                    f"✅ تم اكتمال تمويل قناتك بنجاح!\n"
+                    f"إجمالي الأعضاء المضافين: {added}",
+                    context
+                )
+            
+            # تحديث إحصائيات المستخدم
+            db.execute_query("""
+                UPDATE users 
+                SET total_funded = total_funded + ? 
+                WHERE user_id = ?
+            """, (added, user_id))
+            
+        except Exception as e:
+            logger.error(f"Error in process_funding: {e}")
+            await helpers.safe_send_message(
+                user_id,
+                "❌ حدث خطأ أثناء عملية التمويل. يرجى التواصل مع الدعم الفني.",
+                context
+            )
     
-    @staticmethod
-    async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج الإذاعة"""
-        if not context.user_data.get('awaiting_broadcast'):
-            return
+    def get_unused_number(self, request_id: int) -> Optional[Dict]:
+        """الحصول على رقم غير مستخدم"""
+        result = db.execute_query("""
+            SELECT id, phone_number FROM funding_numbers 
+            WHERE is_used = 0 
+            ORDER BY id ASC 
+            LIMIT 1
+        """, fetch_one=True)
         
-        message = update.message
-        context.user_data['broadcast_message'] = message
+        return dict(result) if result else None
+    
+    async def add_member_to_chat(self, chat_id: str, phone_number: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """إضافة عضو إلى القناة/المجموعة"""
+        try:
+            # هذه محاكاة لإضافة العضو - في الواقع تحتاج إلى استخدام API خاص
+            # أو استخدام حساب تليجرام فعلي
+            logger.info(f"Adding {phone_number} to {chat_id}")
+            
+            # محاكاة نجاح العملية
+            await asyncio.sleep(1)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding member: {e}")
+            return False
+    
+    async def notify_admins_new_funding(self, request_id: int, user_id: int, chat_info: Dict,
+                                      members: int, cost: int, context: ContextTypes.DEFAULT_TYPE):
+        """إشعار المشرفين بطلب تمويل جديد"""
+        user = user_manager.get_user(user_id)
         
-        await message.reply_text(
-            "📢 **معاينة الرسالة:**\n\n"
-            f"{message.text if message.text else '[ميديا]'}\n\n"
-            "هل أنت متأكد من إذاعتها للجميع؟",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=Keyboards.confirm_keyboard("broadcast")
+        text = (
+            f"🔔 طلب تمويل جديد!\n\n"
+            f"👤 المستخدم: {user['first_name']} (@{user['username']})\n"
+            f"🆔 الايدي: {user_id}\n"
+            f"📊 القناة: {chat_info['title']}\n"
+            f"🔗 الرابط: @{chat_info['username'] if chat_info['username'] else 'خاص'}\n"
+            f"👥 عدد الأعضاء: {members}\n"
+            f"💰 التكلفة: {cost} نقطة\n"
+            f"🆔 رقم الطلب: {request_id}\n\n"
+            f"اختر إجراء:"
         )
         
-        context.user_data['awaiting_broadcast'] = False
-        return BROADCAST_CONFIRM
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ قبول", callback_data=f"approve_fund_{request_id}"),
+                InlineKeyboardButton("❌ رفض", callback_data=f"reject_fund_{request_id}")
+            ],
+            [InlineKeyboardButton("🚫 حظر المستخدم", callback_data=f"ban_user_{user_id}")]
+        ]
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    text,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except:
+                pass
+    
+    def get_user_funding(self, user_id: int) -> List[Dict]:
+        """الحصول على تمويلات المستخدم"""
+        results = db.execute_query("""
+            SELECT * FROM funding_requests 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC
+        """, (user_id,))
+        return [dict(row) for row in results]
+    
+    def cancel_funding(self, request_id: int) -> bool:
+        """إلغاء طلب تمويل"""
+        db.execute_query("""
+            UPDATE funding_requests 
+            SET status = 'cancelled' 
+            WHERE request_id = ?
+        """, (request_id,))
+        return True
+
+funding_manager = FundingManager()
+
+# ==================== إدارة ملفات الأرقام ====================
+
+class NumberFileManager:
+    """إدارة ملفات الأرقام"""
     
     @staticmethod
-    async def confirm_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """تأكيد الإذاعة"""
-        query = update.callback_query
-        await query.answer()
+    async def process_numbers_file(file_content: str, file_name: str, admin_id: int) -> Tuple[bool, int, List[str]]:
+        """معالجة ملف الأرقام وإضافته إلى قاعدة البيانات"""
+        numbers = helpers.parse_txt_file(file_content)
         
-        if query.data == "confirm_broadcast":
-            await query.edit_message_text("📤 جاري الإذاعة... الرجاء الانتظار")
-            
-            users = await db.get_all_users()
-            broadcast_message = context.user_data.get('broadcast_message')
-            
-            if not broadcast_message:
-                await query.edit_message_text("❌ لا توجد رسالة")
+        if not numbers:
+            return False, 0, []
+        
+        # حفظ الملف
+        file_path = NUMBERS_DIR / file_name
+        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+            await f.write(file_content)
+        
+        # تسجيل الملف
+        file_id = db.execute_insert("""
+            INSERT INTO number_files (file_name, file_path, numbers_count, added_by)
+            VALUES (?, ?, ?, ?)
+        """, (file_name, str(file_path), len(numbers), admin_id))
+        
+        # إضافة الأرقام
+        added_numbers = []
+        for number in numbers:
+            try:
+                db.execute_query("""
+                    INSERT OR IGNORE INTO funding_numbers (phone_number, added_by, file_name)
+                    VALUES (?, ?, ?)
+                """, (number, admin_id, file_name))
+                added_numbers.append(number)
+            except:
+                pass
+        
+        return True, len(added_numbers), numbers
+    
+    @staticmethod
+    def get_all_files() -> List[Dict]:
+        """الحصول على جميع الملفات"""
+        results = db.execute_query("""
+            SELECT * FROM number_files 
+            ORDER BY added_date DESC
+        """)
+        return [dict(row) for row in results]
+    
+    @staticmethod
+    def delete_file(file_id: int) -> bool:
+        """حذف ملف وأرقامه"""
+        # الحصول على معلومات الملف
+        file_info = db.execute_query(
+            "SELECT * FROM number_files WHERE id = ?",
+            (file_id,),
+            fetch_one=True
+        )
+        
+        if not file_info:
+            return False
+        
+        # حذف الأرقام المرتبطة بالملف
+        db.execute_query(
+            "DELETE FROM funding_numbers WHERE file_name = ?",
+            (file_info['file_name'],)
+        )
+        
+        # حذف سجل الملف
+        db.execute_query(
+            "DELETE FROM number_files WHERE id = ?",
+            (file_id,)
+        )
+        
+        # حذف الملف الفعلي
+        try:
+            os.remove(file_info['file_path'])
+        except:
+            pass
+        
+        return True
+    
+    @staticmethod
+    def get_file_stats() -> Dict:
+        """إحصائيات الملفات"""
+        total_files = db.execute_query(
+            "SELECT COUNT(*) as count FROM number_files",
+            fetch_one=True
+        )
+        
+        total_numbers = db.execute_query(
+            "SELECT COUNT(*) as count FROM funding_numbers",
+            fetch_one=True
+        )
+        
+        used_numbers = db.execute_query(
+            "SELECT COUNT(*) as count FROM funding_numbers WHERE is_used = 1",
+            fetch_one=True
+        )
+        
+        return {
+            'total_files': total_files['count'] if total_files else 0,
+            'total_numbers': total_numbers['count'] if total_numbers else 0,
+            'used_numbers': used_numbers['count'] if used_numbers else 0,
+            'available': (total_numbers['count'] if total_numbers else 0) - (used_numbers['count'] if used_numbers else 0)
+        }
+
+file_manager = NumberFileManager()
+
+# ==================== معالج الإحالات ====================
+
+class ReferralHandler:
+    """معالج روابط الإحالة"""
+    
+    @staticmethod
+    async def process_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """معالجة الدخول عبر رابط إحالة"""
+        try:
+            args = context.args
+            if not args:
                 return
             
-            stats = {'sent': 0, 'failed': 0, 'blocked': 0}
+            referral_code = args[0]
+            user_id = update.effective_user.id
             
-            status_msg = await query.edit_message_text(
-                f"📤 جاري الإذاعة...\nتم الإرسال: {stats['sent']}"
+            # البحث عن صاحب الرابط
+            referrer = db.execute_query(
+                "SELECT user_id FROM referral_links WHERE link_code = ?",
+                (referral_code,),
+                fetch_one=True
             )
             
-            for user in users:
-                try:
-                    if broadcast_message.text:
-                        await context.bot.send_message(
-                            user.user_id,
-                            broadcast_message.text,
-                            parse_mode=ParseMode.HTML
-                        )
-                    else:
-                        await broadcast_message.copy(user.user_id)
-                    
-                    stats['sent'] += 1
-                    
-                except Exception as e:
-                    if "blocked" in str(e).lower():
-                        stats['blocked'] += 1
-                    else:
-                        stats['failed'] += 1
-                
-                if (stats['sent'] + stats['failed'] + stats['blocked']) % 10 == 0:
-                    await status_msg.edit_text(
-                        f"📤 جاري الإذاعة...\n"
-                        f"تم الإرسال: {stats['sent']}\n"
-                        f"فشل: {stats['failed']}\n"
-                        f"محظور: {stats['blocked']}"
-                    )
-                
-                await asyncio.sleep(0.05)
+            if not referrer or referrer['user_id'] == user_id:
+                return
             
-            result = (
-                f"✅ **تمت الإذاعة**\n\n"
-                f"تم الإرسال: {stats['sent']}\n"
-                f"فشل: {stats['failed']}\n"
-                f"محظور البوت: {stats['blocked']}"
+            # التحقق من أن المستخدم ليس مسجلاً مسبقاً
+            existing_user = db.execute_query(
+                "SELECT * FROM users WHERE user_id = ?",
+                (user_id,),
+                fetch_one=True
             )
             
-            await status_msg.edit_text(result, parse_mode=ParseMode.MARKDOWN)
-            
-        else:  # إلغاء
-            await query.edit_message_text("✅ تم إلغاء الإذاعة")
-        
-        context.user_data.clear()
-        await query.message.reply_text(
-            "القائمة الرئيسية",
-            reply_markup=Keyboards.admin_panel()
-        )
+            if not existing_user:
+                # المستخدم جديد - تسجيله تحت المحيل
+                context.user_data['referrer'] = referrer['user_id']
+                
+                # تخزين مؤقت للمحيل
+                temp_data = db.execute_query(
+                    "SELECT value FROM bot_settings WHERE key = 'temp_referrals'",
+                    fetch_one=True
+                )
+                
+                temp_refs = json.loads(temp_data['value']) if temp_data and temp_data['value'] else {}
+                temp_refs[str(user_id)] = referrer['user_id']
+                
+                settings.set('temp_referrals', json.dumps(temp_refs))
+                
+        except Exception as e:
+            logger.error(f"Error processing referral: {e}")
     
     @staticmethod
-    async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """إلغاء العملية الحالية"""
+    def apply_referral_if_exists(user_id: int):
+        """تطبيق الإحالة إذا كانت موجودة"""
+        try:
+            temp_data = settings.get('temp_referrals', '{}')
+            temp_refs = json.loads(temp_data)
+            
+            if str(user_id) in temp_refs:
+                referrer_id = temp_refs[str(user_id)]
+                
+                # إضافة الإحالة
+                user_manager.add_referral(user_id, referrer_id)
+                
+                # إضافة مكافأة للمحيل
+                reward = settings.get_referral_reward()
+                user_manager.update_points(referrer_id, reward, "referral", f"مكافأة دعوة مستخدم جديد")
+                
+                # حذف من المؤقت
+                del temp_refs[str(user_id)]
+                settings.set('temp_referrals', json.dumps(temp_refs))
+                
+                return True
+        except Exception as e:
+            logger.error(f"Error applying referral: {e}")
+        
+        return False
+    
+    @staticmethod
+    def get_referral_link(user_id: int) -> str:
+        """الحصول على رابط إحالة المستخدم"""
+        result = db.execute_query(
+            "SELECT link_code FROM referral_links WHERE user_id = ?",
+            (user_id,),
+            fetch_one=True
+        )
+        
+        if result:
+            return f"https://t.me/{(context.bot.username)}?start={result['link_code']}"
+        
+        # إنشاء رابط جديد
+        code = helpers.generate_code(10)
+        db.execute_query(
+            "INSERT OR REPLACE INTO referral_links (user_id, link_code) VALUES (?, ?)",
+            (user_id, code)
+        )
+        
+        return f"https://t.me/{(context.bot.username)}?start={code}"
+
+referral_handler = ReferralHandler()
+
+# ==================== حالات المحادثة ====================
+
+# حالات المحادثة
+(FUNDING_MEMBERS, FUNDING_LINK, ADMIN_AMOUNT, ADMIN_USER_ID, 
+ ADMIN_FILE, ADMIN_CHANNEL, ADMIN_SUPPORT, ADMIN_REWARD, 
+ ADMIN_COST, ADMIN_FORCE_CHANNEL, ADMIN_BAN_REASON) = range(11)
+
+# ==================== دوال التحقق من العضوية ====================
+
+async def check_force_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """التحقق من الاشتراك في القنوات الإجبارية"""
+    user_id = update.effective_user.id
+    
+    # المشرفون مستثنون
+    if user_id in ADMIN_IDS:
+        return True
+    
+    is_subscribed, not_joined = await force_manager.check_all_memberships(user_id, context)
+    
+    if not is_subscribed:
+        text = "🚫 للوصول إلى البوت، يجب الاشتراك في القنوات التالية أولاً:\n\n"
+        keyboard = force_manager.get_channels_keyboard()
+        
+        await update.message.reply_text(text, reply_markup=keyboard)
+        return False
+    
+    return True
+
+# ==================== ديكوراتور التحقق ====================
+
+def require_subscription(func):
+    """ديكوراتور للتحقق من الاشتراك الإجباري"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if await check_force_subscription(update, context):
+            return await func(update, context, *args, **kwargs)
+        return ConversationHandler.END
+    return wrapper
+
+def admin_only(func):
+    """ديكوراتور للتحقق من صلاحيات المشرف"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
+        if user_id in ADMIN_IDS:
+            return await func(update, context, *args, **kwargs)
+        else:
+            await update.message.reply_text("⛔ هذه الخاصية متاحة فقط للمشرفين.")
+            return ConversationHandler.END
+    return wrapper
+
+def not_banned(func):
+    """ديكوراتور للتحقق من عدم حظر المستخدم"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if user_manager.is_banned(user_id):
+            await update.message.reply_text("🚫 تم حظرك من استخدام البوت.")
+            return ConversationHandler.END
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+# ==================== أوامر المستخدم العامة ====================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """معالج أمر /start"""
+    user = update.effective_user
+    
+    # معالجة الإحالة إذا وجدت
+    await referral_handler.process_referral(update, context)
+    
+    # الحصول على المستخدم أو إنشائه
+    user_data = await user_manager.get_or_create_user(user)
+    
+    # تطبيق الإحالة إذا كانت موجودة
+    referral_handler.apply_referral_if_exists(user.id)
+    
+    # التحقق من العضوية الإجبارية
+    is_subscribed, not_joined = await force_manager.check_all_memberships(user.id, context)
+    
+    if not is_subscribed and user.id not in ADMIN_IDS:
+        text = "🚫 للوصول إلى البوت، يجب الاشتراك في القنوات التالية أولاً:\n\n"
+        keyboard = force_manager.get_channels_keyboard()
+        await update.message.reply_text(text, reply_markup=keyboard)
+        return
+    
+    # عرض واجهة المستخدم الرئيسية
+    welcome_text = settings.get_welcome_message(user.id, user.username or "لا يوجد", user_data['points'])
+    
+    # لوحة المفاتيح الرئيسية
+    keyboard = [
+        [InlineKeyboardButton("💰 تجميع النقاط", callback_data="earn_points")],
+        [InlineKeyboardButton("🚀 تمويل مشتركين", callback_data="start_funding")],
+        [InlineKeyboardButton("📊 تمويلاتي", callback_data="my_funding")],
+        [InlineKeyboardButton("📈 احصائياتي", callback_data="my_stats")],
+        [InlineKeyboardButton("🆘 الدعم الفني", url=f"https://t.me/{settings.get_support_username()}")],
+        [InlineKeyboardButton("📢 قناة البوت", url=f"https://t.me/{settings.get_channel_username()}")]
+    ]
+    
+    await update.message.reply_text(
+        welcome_text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """معالج الأزرار"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    # التحقق من الحظر
+    if user_manager.is_banned(user_id) and user_id not in ADMIN_IDS:
+        await query.edit_message_text("🚫 تم حظرك من استخدام البوت.")
+        return
+    
+    # معالجة الأزرار المختلفة
+    if data == "earn_points":
+        await show_earn_points(update, context)
+    
+    elif data == "start_funding":
+        await start_funding_cmd(update, context)
+    
+    elif data == "my_funding":
+        await show_my_funding(update, context)
+    
+    elif data == "my_stats":
+        await show_my_stats(update, context)
+    
+    elif data == "check_subscription":
+        await check_subscription_callback(update, context)
+    
+    elif data.startswith("approve_fund_"):
+        if user_id in ADMIN_IDS:
+            request_id = int(data.split("_")[2])
+            await approve_funding(update, context, request_id)
+    
+    elif data.startswith("reject_fund_"):
+        if user_id in ADMIN_IDS:
+            request_id = int(data.split("_")[2])
+            await reject_funding(update, context, request_id)
+    
+    elif data.startswith("ban_user_"):
+        if user_id in ADMIN_IDS:
+            target_id = int(data.split("_")[2])
+            await ban_user_from_callback(update, context, target_id)
+
+async def show_earn_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض واجهة تجميع النقاط"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    # الحصول على رابط الدعوة
+    link = referral_handler.get_referral_link(user_id)
+    
+    # إحصائيات الدعوات
+    user = user_manager.get_user(user_id)
+    referrals = user['referrals'] if user else 0
+    reward = settings.get_referral_reward()
+    
+    text = (
+        "💰 **تجميع النقاط**\n\n"
+        "شارك الرابط التالي مع أصدقائك، كل مستخدم جديد يسجل عبر رابطك ستحصل على مكافأة فورية!\n\n"
+        f"🔗 **رابط الدعوة الخاص بك:**\n"
+        f"`{link}`\n\n"
+        f"👥 عدد من دعوتهم: **{referrals}** مستخدم\n"
+        f"🎁 المكافأة لكل دعوة: **{reward}** نقطة\n\n"
+        "📌 يمكنك أيضاً شحن رصيدك عن طريق التواصل مع الدعم الفني."
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("🔙 العودة", callback_data="back_to_main")],
+        [InlineKeyboardButton("🆘 الدعم الفني", url=f"https://t.me/{settings.get_support_username()}")]
+    ]
+    
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def start_funding_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء عملية تمويل جديدة"""
+    query = update.callback_query
+    
+    # التحقق من توفر أرقام
+    available = stats.get_available_numbers()
+    if available == 0:
+        await query.edit_message_text(
+            "❌ عذراً، لا توجد أرقام متاحة للتمويل حالياً.\n"
+            "يرجى المحاولة لاحقاً أو التواصل مع الدعم الفني.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 العودة", callback_data="back_to_main")
+            ]])
+        )
+        return
+    
+    # سعر العضو
+    cost = settings.get_member_cost()
+    
+    text = (
+        "🚀 **تمويل مشتركين**\n\n"
+        f"💰 تكلفة العضو الواحد: **{cost}** نقطة\n"
+        f"📊 الأرقام المتاحة: **{available}** عضو\n\n"
+        "أرسل **عدد الأعضاء** الذي تريد تمويلهم (مثلاً: 10)\n"
+        "أو أرسل /cancel للإلغاء."
+    )
+    
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    # بدء محادثة التمويل
+    return FUNDING_MEMBERS
+
+async def funding_members_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """استقبال عدد الأعضاء من المستخدم"""
+    try:
+        members_count = int(update.message.text.strip())
         
-        context.user_data.clear()
+        if members_count <= 0:
+            await update.message.reply_text("❌ يرجى إرسال رقم صحيح أكبر من 0.")
+            return FUNDING_MEMBERS
         
-        db_user = await db.get_user(user_id)
+        # التحقق من توفر أرقام كافية
+        available = stats.get_available_numbers()
+        if members_count > available:
+            await update.message.reply_text(
+                f"❌ العدد المطلوب أكبر من المتاح!\n"
+                f"المتاح: {available}\n"
+                f"الرجاء إدخال عدد أقل."
+            )
+            return FUNDING_MEMBERS
+        
+        # حساب التكلفة
+        cost = helpers.calculate_cost(members_count, settings.get_member_cost())
+        
+        # التحقق من الرصيد
+        user = user_manager.get_user(update.effective_user.id)
+        if user['points'] < cost:
+            await update.message.reply_text(
+                f"❌ رصيدك غير كافٍ!\n"
+                f"المطلوب: {cost} نقطة\n"
+                f"رصيدك: {user['points']} نقطة\n\n"
+                f"يمكنك تجميع المزيد من النقاط عبر رابط الدعوة."
+            )
+            return ConversationHandler.END
+        
+        # تخزين البيانات مؤقتاً
+        context.user_data['funding_members'] = members_count
+        context.user_data['funding_cost'] = cost
         
         await update.message.reply_text(
-            "✅ تم إلغاء العملية",
-            reply_markup=Keyboards.main_menu(user_id, db_user.is_vip if db_user else False)
+            f"✅ تم استلام الطلب!\n"
+            f"عدد الأعضاء: {members_count}\n"
+            f"التكلفة: {cost} نقطة\n\n"
+            f"الآن أرسل **رابط القناة أو المجموعة** التي تريد تمويلها.\n"
+            f"ملاحظة: يجب أن يكون البوت **مشرفاً** في القناة."
         )
         
-        return ConversationHandler.END
-
-# ==================== معالج أحداث المجموعات ====================
-
-class GroupHandlers:
-    """معالج أحداث المجموعات"""
-    
-    @staticmethod
-    async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """معالج تغيير العضوية"""
-        try:
-            chat_member = update.chat_member
-            chat = update.effective_chat
-            
-            if chat.type == ChatType.PRIVATE:
-                return
-            
-            user = chat_member.new_chat_member.user
-            
-            users = await db.get_all_users()
-            
-            for db_user in users:
-                for channel in db_user.channels:
-                    if channel.id == chat.id:
-                        settings = db_user.settings
-                        
-                        if db_user.expiry_date <= datetime.now(TIMEZONE):
-                            continue
-                        
-                        # انضمام عضو جديد
-                        if (chat_member.new_chat_member.status == 'member' and 
-                            chat_member.old_chat_member.status in ['left', 'kicked']):
-                            
-                            if settings.ban_new_members:
-                                try:
-                                    await context.bot.ban_chat_member(chat.id, user.id)
-                                    logger.info(f"Banned new member {user.id} from {chat.id}")
-                                except Exception as e:
-                                    logger.error(f"Error banning new member: {e}")
-                            
-                            if settings.ban_no_username and not user.username:
-                                try:
-                                    await context.bot.ban_chat_member(chat.id, user.id)
-                                    logger.info(f"Banned no-username member {user.id}")
-                                except Exception as e:
-                                    logger.error(f"Error banning no-username: {e}")
-                        
-                        # مغادرة عضو
-                        elif (chat_member.new_chat_member.status in ['left', 'kicked'] and 
-                              chat_member.old_chat_member.status == 'member'):
-                            
-                            if settings.ban_leavers:
-                                try:
-                                    await context.bot.ban_chat_member(chat.id, user.id)
-                                    logger.info(f"Banned leaver {user.id} from {chat.id}")
-                                except Exception as e:
-                                    logger.error(f"Error banning leaver: {e}")
-                        
-                        break
+        return FUNDING_LINK
         
-        except Exception as e:
-            logger.error(f"Error in chat_member_handler: {e}")
+    except ValueError:
+        await update.message.reply_text("❌ يرجى إرسال رقم صحيح.")
+        return FUNDING_MEMBERS
+
+async def funding_link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """استقبال رابط القناة من المستخدم"""
+    link = update.message.text.strip()
+    
+    # بدء عملية التمويل
+    success = await funding_manager.start_funding(
+        update.effective_user.id,
+        context.user_data['funding_members'],
+        link,
+        context
+    )
+    
+    if success:
+        await update.message.reply_text("✅ جاري بدء عملية التمويل...")
+    else:
+        await update.message.reply_text(
+            "❌ فشل بدء عملية التمويل. تأكد من الرابط وصلاحيات البوت.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 العودة", callback_data="back_to_main")
+            ]])
+        )
+    
+    return ConversationHandler.END
+
+async def show_my_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض تمويلات المستخدم"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    funding_list = funding_manager.get_user_funding(user_id)
+    
+    if not funding_list:
+        await query.edit_message_text(
+            "📊 لا توجد تمويلات سابقة.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 العودة", callback_data="back_to_main")
+            ]])
+        )
+        return
+    
+    text = "📊 **تمويلاتي**\n\n"
+    
+    for fund in funding_list[:5]:  # آخر 5 تمويلات
+        status_emoji = {
+            'pending': '⏳',
+            'completed': '✅',
+            'cancelled': '❌'
+        }.get(fund['status'], '❓')
+        
+        text += (
+            f"{status_emoji} **{fund['chat_title']}**\n"
+            f"🆔: {fund['request_id']}\n"
+            f"👥 الأعضاء: {fund['members_count']}\n"
+            f"✅ المضاف: {fund['added_count']}\n"
+            f"💰 التكلفة: {fund['cost_points']}\n"
+            f"📅 {fund['created_at'][:16]}\n"
+            f"الحالة: {fund['status']}\n"
+            f"{'─' * 20}\n"
+        )
+    
+    keyboard = [[InlineKeyboardButton("🔙 العودة", callback_data="back_to_main")]]
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض إحصائيات المستخدم"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    user = user_manager.get_user(user_id)
+    if not user:
+        await query.edit_message_text("❌ المستخدم غير موجود.")
+        return
+    
+    # إحصائيات إضافية
+    total_funding = db.execute_query(
+        "SELECT COUNT(*) as count, SUM(members_count) as total FROM funding_requests WHERE user_id = ? AND status = 'completed'",
+        (user_id,),
+        fetch_one=True
+    )
+    
+    # تاريخ الانضمام
+    joined = datetime.strptime(user['joined_date'], '%Y-%m-%d %H:%M:%S')
+    days_in_bot = (datetime.now() - joined).days
+    
+    text = (
+        f"📈 **إحصائياتك في البوت**\n\n"
+        f"🆔 **الايدي:** `{user_id}`\n"
+        f"👤 **اليوزر:** @{user['username'] or 'لا يوجد'}\n"
+        f"💰 **النقاط:** {user['points']}\n"
+        f"👥 **الدعوات:** {user['referrals']}\n"
+        f"🚀 **التمويلات المنفذة:** {total_funding['count'] if total_funding else 0}\n"
+        f"👤 **الأعضاء المضافين:** {total_funding['total'] if total_funding else 0}\n"
+        f"📅 **عضو منذ:** {days_in_bot} يوم\n"
+        f"🕐 **آخر نشاط:** {user['last_active'][:16]}\n"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔙 العودة", callback_data="back_to_main")]]
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """العودة إلى القائمة الرئيسية"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    user = user_manager.get_user(user_id)
+    welcome_text = settings.get_welcome_message(user_id, query.from_user.username or "لا يوجد", user['points'])
+    
+    keyboard = [
+        [InlineKeyboardButton("💰 تجميع النقاط", callback_data="earn_points")],
+        [InlineKeyboardButton("🚀 تمويل مشتركين", callback_data="start_funding")],
+        [InlineKeyboardButton("📊 تمويلاتي", callback_data="my_funding")],
+        [InlineKeyboardButton("📈 احصائياتي", callback_data="my_stats")],
+        [InlineKeyboardButton("🆘 الدعم الفني", url=f"https://t.me/{settings.get_support_username()}")],
+        [InlineKeyboardButton("📢 قناة البوت", url=f"https://t.me/{settings.get_channel_username()}")]
+    ]
+    
+    await query.edit_message_text(
+        welcome_text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """التحقق من الاشتراك عند الضغط على الزر"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    is_subscribed, not_joined = await force_manager.check_all_memberships(user_id, context)
+    
+    if is_subscribed or user_id in ADMIN_IDS:
+        # إعادة عرض القائمة الرئيسية
+        user = user_manager.get_user(user_id)
+        welcome_text = settings.get_welcome_message(user_id, query.from_user.username or "لا يوجد", user['points'])
+        
+        keyboard = [
+            [InlineKeyboardButton("💰 تجميع النقاط", callback_data="earn_points")],
+            [InlineKeyboardButton("🚀 تمويل مشتركين", callback_data="start_funding")],
+            [InlineKeyboardButton("📊 تمويلاتي", callback_data="my_funding")],
+            [InlineKeyboardButton("📈 احصائياتي", callback_data="my_stats")],
+            [InlineKeyboardButton("🆘 الدعم الفني", url=f"https://t.me/{settings.get_support_username()}")],
+            [InlineKeyboardButton("📢 قناة البوت", url=f"https://t.me/{settings.get_channel_username()}")]
+        ]
+        
+        await query.edit_message_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        text = "🚫 لم تشترك في جميع القنوات بعد.\n\n"
+        keyboard = force_manager.get_channels_keyboard()
+        await query.edit_message_text(text, reply_markup=keyboard)
+
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """إلغاء المحادثة"""
+    await update.message.reply_text(
+        "✅ تم الإلغاء.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 العودة للقائمة", callback_data="back_to_main")
+        ]])
+    )
+    return ConversationHandler.END
+
+# ==================== لوحة تحكم المشرف ====================
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض لوحة تحكم المشرف"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    text = (
+        "🔧 **لوحة تحكم المشرف**\n\n"
+        "اختر أحد الخيارات التالية:"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 إحصائيات البوت", callback_data="admin_stats")],
+        [InlineKeyboardButton("💰 شحن/خصم رصيد", callback_data="admin_points")],
+        [InlineKeyboardButton("📁 إدارة ملفات الأرقام", callback_data="admin_files")],
+        [InlineKeyboardButton("🆘 إعدادات الدعم", callback_data="admin_support")],
+        [InlineKeyboardButton("📢 إعدادات القناة", callback_data="admin_channel")],
+        [InlineKeyboardButton("🚫 إدارة الحظر", callback_data="admin_ban")],
+        [InlineKeyboardButton("🎁 تعديل مكافأة الدعوة", callback_data="admin_reward")],
+        [InlineKeyboardButton("💰 تعديل سعر العضو", callback_data="admin_cost")],
+        [InlineKeyboardButton("📢 إدارة القنوات الإجبارية", callback_data="admin_force")],
+        [InlineKeyboardButton("📝 تعديل رسالة الترحيب", callback_data="admin_welcome")],
+        [InlineKeyboardButton("💾 نسخة احتياطية", callback_data="admin_backup")],
+    ]
+    
+    if update.message:
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.callback_query.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+async def admin_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض إحصائيات البوت للمشرف"""
+    query = update.callback_query
+    
+    # إحصائيات شاملة
+    total_users = stats.get_total_users()
+    active_users = stats.get_active_users()
+    banned_users = stats.get_banned_users()
+    total_points = stats.get_total_points()
+    total_funding = stats.get_total_funding()
+    total_members = stats.get_total_members_added()
+    available_numbers = stats.get_available_numbers()
+    total_numbers = stats.get_total_numbers()
+    
+    # إحصائيات الملفات
+    file_stats = file_manager.get_file_stats()
+    
+    # أفضل المستخدمين
+    top_users = stats.get_top_users(5)
+    top_text = ""
+    for i, user in enumerate(top_users, 1):
+        top_text += f"{i}. @{user['username'] or 'مجهول'} - {user['points']} نقطة\n"
+    
+    text = (
+        f"📊 **إحصائيات البوت**\n\n"
+        f"👥 **المستخدمين**\n"
+        f"المجموع: {total_users}\n"
+        f"النشطين (7 أيام): {active_users}\n"
+        f"المحظورين: {banned_users}\n\n"
+        f"💰 **النقاط**\n"
+        f"إجمالي النقاط: {total_points}\n"
+        f"معدل النقاط: {total_points // max(total_users, 1)}\n\n"
+        f"🚀 **التمويل**\n"
+        f"عمليات التمويل: {total_funding}\n"
+        f"الأعضاء المضافين: {total_members}\n\n"
+        f"📁 **الأرقام**\n"
+        f"الإجمالي: {total_numbers}\n"
+        f"المستخدم: {file_stats['used_numbers']}\n"
+        f"المتبقي: {file_stats['available']}\n"
+        f"الملفات: {file_stats['total_files']}\n\n"
+        f"🏆 **أفضل 5 مستخدمين**\n"
+        f"{top_text}"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")]]
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_points_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء عملية شحن/خصم الرصيد"""
+    query = update.callback_query
+    
+    text = (
+        "💰 **شحن/خصم رصيد**\n\n"
+        "أرسل **ايدي المستخدم** الذي تريد تعديل رصيده:\n"
+        "أو أرسل /cancel للإلغاء."
+    )
+    
+    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+    return ADMIN_USER_ID
+
+async def admin_user_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """استقبال ايدي المستخدم"""
+    try:
+        user_id = int(update.message.text.strip())
+        user = user_manager.get_user(user_id)
+        
+        if not user:
+            await update.message.reply_text("❌ المستخدم غير موجود في قاعدة البيانات.")
+            return ConversationHandler.END
+        
+        context.user_data['target_user_id'] = user_id
+        context.user_data['target_user'] = user
+        
+        await update.message.reply_text(
+            f"👤 المستخدم: @{user['username'] or 'مجهول'}\n"
+            f"💰 الرصيد الحالي: {user['points']}\n\n"
+            f"أرسل المبلغ الذي تريد **شحنه** (استخدم - للخصم)\n"
+            f"مثال: 100 أو -50"
+        )
+        return ADMIN_AMOUNT
+        
+    except ValueError:
+        await update.message.reply_text("❌ يرجى إرسال رقم صحيح.")
+        return ADMIN_USER_ID
+
+async def admin_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """استقبال المبلغ وتعديل الرصيد"""
+    try:
+        amount = int(update.message.text.strip())
+        user_id = context.user_data['target_user_id']
+        
+        success = user_manager.update_points(
+            user_id,
+            amount,
+            "admin_adjust",
+            f"تعديل بواسطة المشرف"
+        )
+        
+        if success:
+            new_balance = user_manager.get_user(user_id)['points']
+            await update.message.reply_text(
+                f"✅ تم تعديل الرصيد بنجاح!\n"
+                f"المبلغ: {amount:+d}\n"
+                f"الرصيد الجديد: {new_balance}"
+            )
+            
+            # إشعار المستخدم
+            action = "شحن" if amount > 0 else "خصم"
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    f"💰 تم {action} رصيدك بمقدار {abs(amount)} نقطة بواسطة المشرف.\n"
+                    f"رصيدك الحالي: {new_balance}"
+                )
+            except:
+                pass
+        else:
+            await update.message.reply_text("❌ فشل تعديل الرصيد.")
+        
+        # عرض لوحة التحكم مجدداً
+        await admin_panel(update, context)
+        return ConversationHandler.END
+        
+    except ValueError:
+        await update.message.reply_text("❌ يرجى إرسال رقم صحيح.")
+        return ADMIN_AMOUNT
+
+async def admin_files_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إدارة ملفات الأرقام"""
+    query = update.callback_query
+    
+    file_stats = file_manager.get_file_stats()
+    files = file_manager.get_all_files()
+    
+    text = (
+        f"📁 **إدارة ملفات الأرقام**\n\n"
+        f"إجمالي الملفات: {file_stats['total_files']}\n"
+        f"إجمالي الأرقام: {file_stats['total_numbers']}\n"
+        f"الأرقام المستخدمة: {file_stats['used_numbers']}\n"
+        f"الأرقام المتاحة: {file_stats['available']}\n\n"
+    )
+    
+    if files:
+        text += "**الملفات المضافة:**\n"
+        for file in files[:5]:
+            text += f"📄 {file['file_name']} - {file['numbers_count']} رقم - {file['added_date'][:16]}\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ إضافة ملف جديد", callback_data="admin_add_file")],
+        [InlineKeyboardButton("🗑 حذف ملف", callback_data="admin_delete_file")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")]
+    ]
+    
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_add_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء عملية إضافة ملف"""
+    query = update.callback_query
+    
+    await query.edit_message_text(
+        "📁 أرسل ملف **txt** يحتوي على أرقام الهواتف (رقم واحد في كل سطر).\n"
+        "أو أرسل /cancel للإلغاء."
+    )
+    return ADMIN_FILE
+
+async def admin_file_receive_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """استقبال ملف الأرقام"""
+    if not update.message.document:
+        await update.message.reply_text("❌ يرجى إرسال ملف بصيغة txt.")
+        return ADMIN_FILE
+    
+    file = update.message.document
+    if not file.file_name.endswith('.txt'):
+        await update.message.reply_text("❌ الملف يجب أن يكون بصيغة txt فقط.")
+        return ADMIN_FILE
+    
+    try:
+        # تحميل الملف
+        new_file = await context.bot.get_file(file.file_id)
+        file_content = await new_file.download_as_bytearray()
+        content = file_content.decode('utf-8')
+        
+        # معالجة الملف
+        success, count, numbers = await file_manager.process_numbers_file(
+            content,
+            f"{int(time.time())}_{file.file_name}",
+            update.effective_user.id
+        )
+        
+        if success:
+            await update.message.reply_text(
+                f"✅ تم إضافة الملف بنجاح!\n"
+                f"إجمالي الأرقام: {count}\n"
+                f"الأرقام المكررة: {len(numbers) - count}"
+            )
+        else:
+            await update.message.reply_text("❌ فشل معالجة الملف.")
+        
+    except Exception as e:
+        logger.error(f"Error processing file: {e}")
+        await update.message.reply_text("❌ حدث خطأ أثناء معالجة الملف.")
+    
+    # العودة للوحة التحكم
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_delete_file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف ملف"""
+    query = update.callback_query
+    
+    files = file_manager.get_all_files()
+    if not files:
+        await query.edit_message_text(
+            "❌ لا توجد ملفات للحذف.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")
+            ]])
+        )
+        return
+    
+    keyboard = []
+    for file in files[:10]:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📄 {file['file_name']} ({file['numbers_count']} رقم)",
+                callback_data=f"delete_file_{file['id']}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")])
+    
+    await query.edit_message_text(
+        "اختر الملف الذي تريد حذفه:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def delete_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف ملف محدد"""
+    query = update.callback_query
+    file_id = int(query.data.split("_")[2])
+    
+    success = file_manager.delete_file(file_id)
+    
+    if success:
+        await query.answer("✅ تم حذف الملف بنجاح!")
+        await query.edit_message_text("✅ تم حذف الملف.")
+    else:
+        await query.answer("❌ فشل حذف الملف!")
+    
+    # العودة لإدارة الملفات
+    await admin_files_handler(update, context)
+
+async def admin_support_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تعديل حساب الدعم"""
+    query = update.callback_query
+    
+    current = settings.get_support_username()
+    
+    await query.edit_message_text(
+        f"🆘 **إعدادات الدعم الفني**\n\n"
+        f"الحالي: @{current}\n\n"
+        f"أرسل اسم المستخدم الجديد للدعم (بدون @):\n"
+        f"أو أرسل /cancel للإلغاء."
+    )
+    return ADMIN_SUPPORT
+
+async def admin_support_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحديث حساب الدعم"""
+    username = update.message.text.strip().replace('@', '')
+    
+    settings.set('support_username', username)
+    
+    await update.message.reply_text(f"✅ تم تحديث حساب الدعم إلى: @{username}")
+    
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تعديل رابط القناة"""
+    query = update.callback_query
+    
+    current = settings.get_channel_username()
+    
+    await query.edit_message_text(
+        f"📢 **إعدادات قناة البوت**\n\n"
+        f"الحالي: @{current}\n\n"
+        f"أرسل اسم المستخدم الجديد للقناة (بدون @):\n"
+        f"أو أرسل /cancel للإلغاء."
+    )
+    return ADMIN_CHANNEL
+
+async def admin_channel_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحديث رابط القناة"""
+    username = update.message.text.strip().replace('@', '')
+    
+    settings.set('channel_username', username)
+    
+    await update.message.reply_text(f"✅ تم تحديث رابط القناة إلى: @{username}")
+    
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_ban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إدارة الحظر"""
+    query = update.callback_query
+    
+    keyboard = [
+        [InlineKeyboardButton("🚫 حظر مستخدم", callback_data="admin_ban_user")],
+        [InlineKeyboardButton("✅ رفع حظر", callback_data="admin_unban_user")],
+        [InlineKeyboardButton("📋 قائمة المحظورين", callback_data="admin_banned_list")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")]
+    ]
+    
+    await query.edit_message_text(
+        "🚫 **إدارة الحظر**\n\nاختر الإجراء المطلوب:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_ban_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء عملية حظر مستخدم"""
+    query = update.callback_query
+    
+    await query.edit_message_text(
+        "🚫 أرسل **ايدي المستخدم** الذي تريد حظره:\n"
+        "أو أرسل /cancel للإلغاء."
+    )
+    return ADMIN_BAN_REASON
+
+async def admin_ban_user_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تنفيذ حظر مستخدم"""
+    try:
+        user_id = int(update.message.text.strip())
+        
+        if user_id in ADMIN_IDS:
+            await update.message.reply_text("❌ لا يمكن حظر مشرف.")
+            return ConversationHandler.END
+        
+        if user_manager.is_banned(user_id):
+            await update.message.reply_text("❌ المستخدم محظور بالفعل.")
+            return ConversationHandler.END
+        
+        context.user_data['ban_user_id'] = user_id
+        
+        await update.message.reply_text(
+            "أرسل سبب الحظر (اختياري) أو أرسل /skip لتخطي:"
+        )
+        return ADMIN_BAN_REASON + 1  # رقم مؤقت للحالة
+        
+    except ValueError:
+        await update.message.reply_text("❌ يرجى إرسال رقم صحيح.")
+        return ADMIN_BAN_REASON
+
+async def admin_ban_reason_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """استقبال سبب الحظر"""
+    reason = update.message.text.strip() if update.message.text != "/skip" else "بدون سبب"
+    
+    user_id = context.user_data['ban_user_id']
+    success = user_manager.ban_user(user_id, update.effective_user.id, reason)
+    
+    if success:
+        await update.message.reply_text(f"✅ تم حظر المستخدم {user_id}\nالسبب: {reason}")
+    else:
+        await update.message.reply_text("❌ فشل حظر المستخدم.")
+    
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_unban_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """رفع الحظر عن مستخدم"""
+    query = update.callback_query
+    
+    await query.edit_message_text(
+        "✅ أرسل **ايدي المستخدم** الذي تريد رفع الحظر عنه:\n"
+        "أو أرسل /cancel للإلغاء."
+    )
+    return ADMIN_USER_ID  # إعادة استخدام حالة استقبال الايدي
+
+async def admin_unban_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تنفيذ رفع الحظر"""
+    try:
+        user_id = int(update.message.text.strip())
+        
+        if not user_manager.is_banned(user_id):
+            await update.message.reply_text("❌ المستخدم غير محظور.")
+            return ConversationHandler.END
+        
+        success = user_manager.unban_user(user_id)
+        
+        if success:
+            await update.message.reply_text(f"✅ تم رفع الحظر عن المستخدم {user_id}")
+        else:
+            await update.message.reply_text("❌ فشل رفع الحظر.")
+        
+    except ValueError:
+        await update.message.reply_text("❌ يرجى إرسال رقم صحيح.")
+        return ADMIN_USER_ID
+    
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_banned_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض قائمة المحظورين"""
+    query = update.callback_query
+    
+    banned = db.execute_query("""
+        SELECT u.user_id, u.username, b.reason, b.banned_date 
+        FROM banned_users b
+        JOIN users u ON u.user_id = b.user_id
+        ORDER BY b.banned_date DESC
+        LIMIT 20
+    """)
+    
+    if not banned:
+        await query.edit_message_text(
+            "📋 لا يوجد مستخدمين محظورين.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")
+            ]])
+        )
+        return
+    
+    text = "📋 **قائمة المحظورين**\n\n"
+    for user in banned:
+        text += (
+            f"🆔 `{user['user_id']}`\n"
+            f"👤 @{user['username'] or 'مجهول'}\n"
+            f"📅 {user['banned_date'][:16]}\n"
+            f"📝 {user['reason'] or 'بدون سبب'}\n"
+            f"{'─' * 20}\n"
+        )
+    
+    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")]]
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_reward_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تعديل مكافأة الدعوة"""
+    query = update.callback_query
+    
+    current = settings.get_referral_reward()
+    
+    await query.edit_message_text(
+        f"🎁 **مكافأة الدعوة**\n\n"
+        f"الحالية: {current} نقطة\n\n"
+        f"أرسل القيمة الجديدة:\n"
+        f"أو أرسل /cancel للإلغاء."
+    )
+    return ADMIN_REWARD
+
+async def admin_reward_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحديث مكافأة الدعوة"""
+    try:
+        value = int(update.message.text.strip())
+        if value <= 0:
+            raise ValueError
+        
+        settings.set('referral_reward', str(value))
+        
+        await update.message.reply_text(f"✅ تم تحديث مكافأة الدعوة إلى: {value} نقطة")
+        
+    except ValueError:
+        await update.message.reply_text("❌ يرجى إرسال رقم صحيح أكبر من 0.")
+        return ADMIN_REWARD
+    
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_cost_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تعديل سعر العضو"""
+    query = update.callback_query
+    
+    current = settings.get_member_cost()
+    
+    await query.edit_message_text(
+        f"💰 **سعر العضو**\n\n"
+        f"الحالي: {current} نقطة\n\n"
+        f"أرسل القيمة الجديدة:\n"
+        f"أو أرسل /cancel للإلغاء."
+    )
+    return ADMIN_COST
+
+async def admin_cost_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحديث سعر العضو"""
+    try:
+        value = int(update.message.text.strip())
+        if value <= 0:
+            raise ValueError
+        
+        settings.set('member_cost', str(value))
+        
+        await update.message.reply_text(f"✅ تم تحديث سعر العضو إلى: {value} نقطة")
+        
+    except ValueError:
+        await update.message.reply_text("❌ يرجى إرسال رقم صحيح أكبر من 0.")
+        return ADMIN_COST
+    
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_force_channels_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إدارة القنوات الإجبارية"""
+    query = update.callback_query
+    
+    channels = force_manager.get_all_channels()
+    
+    text = "📢 **القنوات الإجبارية**\n\n"
+    if channels:
+        for i, channel in enumerate(channels, 1):
+            text += f"{i}. {channel['channel_title']} - @{channel['channel_username']}\n"
+    else:
+        text += "لا توجد قنوات إجبارية.\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ إضافة قناة", callback_data="admin_add_force")],
+        [InlineKeyboardButton("🗑 حذف قناة", callback_data="admin_remove_force")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")]
+    ]
+    
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_add_force_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إضافة قناة إجبارية جديدة"""
+    query = update.callback_query
+    
+    await query.edit_message_text(
+        "📢 أرسل **معرف القناة** أو **الرابط** (مثال: @channel أو https://t.me/channel):\n"
+        "أو أرسل /cancel للإلغاء."
+    )
+    return ADMIN_FORCE_CHANNEL
+
+async def admin_add_force_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تنفيذ إضافة القناة الإجبارية"""
+    try:
+        channel_input = update.message.text.strip()
+        chat_info = await funding_manager.extract_chat_info(channel_input, context)
+        
+        if not chat_info:
+            await update.message.reply_text(
+                "❌ لم أتمكن من العثور على القناة. تأكد من صحة الرابط وأن البوت مشرف فيها."
+            )
+            return ADMIN_FORCE_CHANNEL
+        
+        # إضافة القناة
+        success = force_manager.add_channel(
+            chat_info['chat_id'],
+            chat_info['username'] or chat_info['chat_id'],
+            chat_info['title'],
+            update.effective_user.id
+        )
+        
+        if success:
+            await update.message.reply_text(f"✅ تم إضافة القناة {chat_info['title']} بنجاح!")
+        else:
+            await update.message.reply_text("❌ فشل إضافة القناة.")
+        
+    except Exception as e:
+        logger.error(f"Error adding force channel: {e}")
+        await update.message.reply_text("❌ حدث خطأ أثناء إضافة القناة.")
+    
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_remove_force_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف قناة إجبارية"""
+    query = update.callback_query
+    
+    channels = force_manager.get_all_channels()
+    if not channels:
+        await query.edit_message_text(
+            "❌ لا توجد قنوات للحذف.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")
+            ]])
+        )
+        return
+    
+    keyboard = []
+    for channel in channels:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🗑 {channel['channel_title']}",
+                callback_data=f"remove_force_{channel['channel_id']}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_back")])
+    
+    await query.edit_message_text(
+        "اختر القناة التي تريد حذفها:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def remove_force_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف قناة إجبارية محددة"""
+    query = update.callback_query
+    channel_id = query.data.split("_")[2]
+    
+    success = force_manager.remove_channel(channel_id)
+    
+    if success:
+        await query.answer("✅ تم حذف القناة بنجاح!")
+    else:
+        await query.answer("❌ فشل حذف القناة!")
+    
+    # العودة لإدارة القنوات
+    await admin_force_channels_handler(update, context)
+
+async def admin_welcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تعديل رسالة الترحيب"""
+    query = update.callback_query
+    
+    current = settings.get('welcome_message', 
+        "👋 مرحباً بك في بوت التمويل!\nنقاطك: {points}\nايديك: {user_id}\n@{username}")
+    
+    await query.edit_message_text(
+        f"📝 **رسالة الترحيب الحالية:**\n\n{current}\n\n"
+        f"أرسل الرسالة الجديدة (يمكنك استخدام المتغيرات: {{points}}, {{user_id}}, {{username}}):\n"
+        f"أو أرسل /cancel للإلغاء."
+    )
+    return ADMIN_REWARD  # إعادة استخدام حالة مؤقتة
+
+async def admin_welcome_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحديث رسالة الترحيب"""
+    new_message = update.message.text.strip()
+    
+    settings.set('welcome_message', new_message)
+    
+    await update.message.reply_text("✅ تم تحديث رسالة الترحيب بنجاح!")
+    
+    await admin_panel(update, context)
+    return ConversationHandler.END
+
+async def admin_backup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إنشاء نسخة احتياطية"""
+    query = update.callback_query
+    
+    try:
+        backup_path = helpers.create_backup()
+        
+        # إرسال الملف
+        await context.bot.send_document(
+            query.message.chat_id,
+            document=open(backup_path, 'rb'),
+            filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
+            caption="✅ نسخة احتياطية من قاعدة البيانات"
+        )
+        
+        await query.answer("✅ تم إنشاء النسخة الاحتياطية!")
+        
+    except Exception as e:
+        logger.error(f"Error creating backup: {e}")
+        await query.edit_message_text("❌ فشل إنشاء النسخة الاحتياطية.")
+    
+    # العودة للوحة التحكم
+    await admin_panel(update, context)
+
+async def approve_funding(update: Update, context: ContextTypes.DEFAULT_TYPE, request_id: int):
+    """الموافقة على طلب تمويل"""
+    query = update.callback_query
+    
+    # تحديث الحالة
+    db.execute_query(
+        "UPDATE funding_requests SET status = 'approved' WHERE request_id = ?",
+        (request_id,)
+    )
+    
+    await query.edit_message_text("✅ تمت الموافقة على طلب التمويل.")
+
+async def reject_funding(update: Update, context: ContextTypes.DEFAULT_TYPE, request_id: int):
+    """رفض طلب تمويل"""
+    query = update.callback_query
+    
+    # استرجاع معلومات الطلب
+    request = db.execute_query(
+        "SELECT * FROM funding_requests WHERE request_id = ?",
+        (request_id,),
+        fetch_one=True
+    )
+    
+    if request:
+        # إعادة النقاط للمستخدم
+        user_manager.update_points(
+            request['user_id'],
+            request['cost_points'],
+            "refund",
+            "استرداد نقاط تمويل ملغي"
+        )
+        
+        # تحديث الحالة
+        db.execute_query(
+            "UPDATE funding_requests SET status = 'rejected' WHERE request_id = ?",
+            (request_id,)
+        )
+        
+        # إشعار المستخدم
+        try:
+            await context.bot.send_message(
+                request['user_id'],
+                f"❌ تم رفض طلب التمويل الخاص بك.\n"
+                f"تم استرداد {request['cost_points']} نقطة إلى رصيدك."
+            )
+        except:
+            pass
+    
+    await query.edit_message_text("❌ تم رفض طلب التمويل.")
+
+async def ban_user_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
+    """حظر مستخدم من خلال إشعار التمويل"""
+    query = update.callback_query
+    
+    if target_id in ADMIN_IDS:
+        await query.answer("⛔ لا يمكن حظر مشرف!")
+        return
+    
+    success = user_manager.ban_user(target_id, query.from_user.id, "حظر من إشعار تمويل")
+    
+    if success:
+        await query.edit_message_text(f"✅ تم حظر المستخدم {target_id}.")
+    else:
+        await query.answer("❌ فشل حظر المستخدم.")
+
+async def admin_back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """العودة إلى لوحة التحكم الرئيسية"""
+    await admin_panel(update, context)
 
 # ==================== معالج الأخطاء ====================
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج الأخطاء"""
-    logger.error(f"Exception: {context.error}")
-    
+    """معالج الأخطاء العام"""
     try:
-        if update and update.effective_chat:
-            await context.bot.send_message(
-                update.effective_chat.id,
-                "❌ حدث خطأ. الرجاء المحاولة لاحقاً."
-            )
-    except:
-        pass
-    
-    try:
-        tb = traceback.format_exception(None, context.error, context.error.__traceback__)
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"⚠️ **خطأ في البوت**\n\n{''.join(tb)[:3500]}",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except:
-        pass
+        raise context.error
+    except Exception as e:
+        logger.error(f"Update {update} caused error {e}")
+        
+        # إشعار المشرفين بخطأ كبير
+        if update and update.effective_user:
+            error_text = f"⚠️ خطأ في البوت:\n{str(e)[:200]}"
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(admin_id, error_text)
+                except:
+                    pass
 
-# ==================== تهيئة البوت ====================
-
-async def post_init(application: Application):
-    """بعد تهيئة البوت"""
-    await db.init_tables()
-    logger.info("✅ Bot initialized")
+# ==================== تهيئة البوت وتشغيله ====================
 
 def main():
-    """تشغيل البوت"""
+    """الدالة الرئيسية لتشغيل البوت"""
     
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    # إنشاء التطبيق
+    application = Application.builder().token(BOT_TOKEN).build()
     
-    # أوامر أساسية
-    application.add_handler(CommandHandler("start", CommandHandlers.start))
-    application.add_handler(CommandHandler("cancel", CommandHandlers.cancel))
+    # ========== معالجي الأوامر العامة ==========
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(?!admin_|delete_file_|remove_force_).*$"))
     
-    # محادثة إضافة قناة
-    add_channel_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(CommandHandlers.add_channel_start, pattern="^add_channel$")],
+    # ========== معالجي لوحة التحكم ==========
+    application.add_handler(CallbackQueryHandler(admin_stats_handler, pattern="^admin_stats$"))
+    application.add_handler(CallbackQueryHandler(admin_points_handler, pattern="^admin_points$"))
+    application.add_handler(CallbackQueryHandler(admin_files_handler, pattern="^admin_files$"))
+    application.add_handler(CallbackQueryHandler(admin_add_file_handler, pattern="^admin_add_file$"))
+    application.add_handler(CallbackQueryHandler(admin_delete_file_handler, pattern="^admin_delete_file$"))
+    application.add_handler(CallbackQueryHandler(delete_file_callback, pattern="^delete_file_"))
+    application.add_handler(CallbackQueryHandler(admin_support_handler, pattern="^admin_support$"))
+    application.add_handler(CallbackQueryHandler(admin_channel_handler, pattern="^admin_channel$"))
+    application.add_handler(CallbackQueryHandler(admin_ban_handler, pattern="^admin_ban$"))
+    application.add_handler(CallbackQueryHandler(admin_ban_user_handler, pattern="^admin_ban_user$"))
+    application.add_handler(CallbackQueryHandler(admin_unban_user_handler, pattern="^admin_unban_user$"))
+    application.add_handler(CallbackQueryHandler(admin_banned_list_handler, pattern="^admin_banned_list$"))
+    application.add_handler(CallbackQueryHandler(admin_reward_handler, pattern="^admin_reward$"))
+    application.add_handler(CallbackQueryHandler(admin_cost_handler, pattern="^admin_cost$"))
+    application.add_handler(CallbackQueryHandler(admin_force_channels_handler, pattern="^admin_force$"))
+    application.add_handler(CallbackQueryHandler(admin_add_force_handler, pattern="^admin_add_force$"))
+    application.add_handler(CallbackQueryHandler(admin_remove_force_handler, pattern="^admin_remove_force$"))
+    application.add_handler(CallbackQueryHandler(remove_force_callback, pattern="^remove_force_"))
+    application.add_handler(CallbackQueryHandler(admin_welcome_handler, pattern="^admin_welcome$"))
+    application.add_handler(CallbackQueryHandler(admin_backup_handler, pattern="^admin_backup$"))
+    application.add_handler(CallbackQueryHandler(admin_back_handler, pattern="^admin_back$"))
+    
+    # ========== معالجي محادثة التمويل ==========
+    funding_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_funding_cmd, pattern="^start_funding$")],
         states={
-            ADD_CHANNEL_WAITING_LINK: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, CommandHandlers.handle_channel_link)
-            ],
+            FUNDING_MEMBERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, funding_members_handler)],
+            FUNDING_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, funding_link_handler)],
         },
-        fallbacks=[CommandHandler("cancel", CommandHandlers.cancel)],
-        per_message=False
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
-    application.add_handler(add_channel_conv)
+    application.add_handler(funding_conv)
     
-    # محادثة تغيير السعر
-    change_price_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(
-            lambda u, c: CommandHandlers.handle_callback(u, c) 
-            if u.callback_query.data == "admin_change_price" else None,
-            pattern="^admin_change_price$"
-        )],
+    # ========== معالجي محادثة شحن/خصم الرصيد ==========
+    points_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_points_handler, pattern="^admin_points$")],
         states={
-            CHANGE_PRICE_WAITING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, CommandHandlers.handle_price_change)
-            ],
+            ADMIN_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_id_handler)],
+            ADMIN_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_amount_handler)],
         },
-        fallbacks=[CommandHandler("cancel", CommandHandlers.cancel)],
-        per_message=False
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
-    application.add_handler(change_price_conv)
+    application.add_handler(points_conv)
     
-    # محادثة تفعيل VIP
-    activate_vip_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(
-            lambda u, c: CommandHandlers.handle_callback(u, c) 
-            if u.callback_query.data == "admin_activate_vip" else None,
-            pattern="^admin_activate_vip$"
-        )],
+    # ========== معالجي محادثة إضافة ملف ==========
+    file_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_add_file_handler, pattern="^admin_add_file$")],
         states={
-            ACTIVATE_VIP_WAITING_USER_ID: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, CommandHandlers.handle_activate_vip)
-            ],
-            ACTIVATE_VIP_WAITING_DAYS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, CommandHandlers.handle_activate_vip)
-            ],
+            ADMIN_FILE: [MessageHandler(filters.Document.ALL, admin_file_receive_handler)],
         },
-        fallbacks=[CommandHandler("cancel", CommandHandlers.cancel)],
-        per_message=False
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
-    application.add_handler(activate_vip_conv)
+    application.add_handler(file_conv)
     
-    # محادثة الإذاعة
-    broadcast_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(
-            lambda u, c: CommandHandlers.handle_callback(u, c) 
-            if u.callback_query.data == "admin_broadcast" else None,
-            pattern="^admin_broadcast$"
-        )],
+    # ========== معالجي محادثة تحديث الدعم ==========
+    support_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_support_handler, pattern="^admin_support$")],
         states={
-            BROADCAST_WAITING_MESSAGE: [
-                MessageHandler(filters.ALL & ~filters.COMMAND, CommandHandlers.handle_broadcast)
-            ],
-            BROADCAST_CONFIRM: [
-                CallbackQueryHandler(CommandHandlers.confirm_broadcast, pattern="^(confirm|cancel)_broadcast$")
-            ],
+            ADMIN_SUPPORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_support_update_handler)],
         },
-        fallbacks=[CommandHandler("cancel", CommandHandlers.cancel)],
-        per_message=False
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
-    application.add_handler(broadcast_conv)
+    application.add_handler(support_conv)
     
-    # معالج الأزرار الرئيسي
-    application.add_handler(CallbackQueryHandler(CommandHandlers.handle_callback))
+    # ========== معالجي محادثة تحديث القناة ==========
+    channel_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_channel_handler, pattern="^admin_channel$")],
+        states={
+            ADMIN_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_channel_update_handler)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    application.add_handler(channel_conv)
     
-    # معالج أحداث المجموعات
-    application.add_handler(ChatMemberHandler(
-        GroupHandlers.handle_chat_member, 
-        ChatMemberHandler.CHAT_MEMBER
-    ))
+    # ========== معالجي محادثة مكافأة الدعوة ==========
+    reward_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_reward_handler, pattern="^admin_reward$")],
+        states={
+            ADMIN_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reward_update_handler)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    application.add_handler(reward_conv)
     
-    # معالج الأخطاء
+    # ========== معالجي محادثة سعر العضو ==========
+    cost_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_cost_handler, pattern="^admin_cost$")],
+        states={
+            ADMIN_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_cost_update_handler)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    application.add_handler(cost_conv)
+    
+    # ========== معالجي محادثة إضافة قناة إجبارية ==========
+    force_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_add_force_handler, pattern="^admin_add_force$")],
+        states={
+            ADMIN_FORCE_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_force_execute)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    application.add_handler(force_conv)
+    
+    # ========== معالجي محادثة حظر مستخدم ==========
+    ban_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_ban_user_handler, pattern="^admin_ban_user$")],
+        states={
+            ADMIN_BAN_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ban_reason_handler)],
+            ADMIN_BAN_REASON + 1: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ban_reason_handler)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    application.add_handler(ban_conv)
+    
+    # ========== معالجي محادثة رفع الحظر ==========
+    unban_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_unban_user_handler, pattern="^admin_unban_user$")],
+        states={
+            ADMIN_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_unban_execute)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    application.add_handler(unban_conv)
+    
+    # ========== معالجي محادثة رسالة الترحيب ==========
+    welcome_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_welcome_handler, pattern="^admin_welcome$")],
+        states={
+            ADMIN_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_welcome_update_handler)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    application.add_handler(welcome_conv)
+    
+    # ========== معالج الأخطاء ==========
     application.add_error_handler(error_handler)
     
     # تشغيل البوت
-    logger.info("🚀 Starting bot...")
-    print("\n" + "="*50)
-    print("✅ البوت يعمل بنجاح!")
-    print(f"👤 المدير: @{ADMIN_USERNAME}")
-    print(f"💰 سعر VIP: {VIP_PRICE} نجمة")
-    print(f"📝 سجل الأحداث: bot.log")
-    print("="*50 + "\n")
+    print(f"{Fore.GREEN}{'='*50}")
+    print(f"{Fore.GREEN}تم تشغيل بوت التمويل بنجاح!")
+    print(f"{Fore.GREEN}توكن البوت: {BOT_TOKEN}")
+    print(f"{Fore.GREEN}المشرفون: {ADMIN_IDS}")
+    print(f"{Fore.GREEN}{'='*50}")
     
+    # بدء البوت
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"{Fore.YELLOW}\nتم إيقاف البوت بواسطة المستخدم.")
+    except Exception as e:
+        print(f"{Fore.RED}\nخطأ غير متوقع: {e}")
+        logger.error(f"Fatal error: {e}", exc_info=True)
